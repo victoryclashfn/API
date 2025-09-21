@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fortnite-analysis-api
+    env: node
+    buildCommand: |
+      apt-get update
+      apt-get install -y ffmpeg
+      npm install
+    startCommand: node server.js
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
