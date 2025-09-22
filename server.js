@@ -50,48 +50,41 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     const { description } = req.body; // optional extra text
     const videoFile = req.file;
 
-    if (!description && !videoFile) {
-      return res.status(400).json({ error: "No description or video provided" });
-    }
-
-    // Build messages
-    let input = [
-      {
-        role: "system",
-        content: "You are an assistant that analyzes Fortnite gameplay and provides insights and feedback."
-      }
+    let messages = [
+      { role: "system", content: "You are an assistant that analyzes Fortnite/gameplay and provides insights and feedback on how to improve." }
     ];
 
+    // Add text description if present
     if (description) {
-      input.push({
-        role: "user",
-        content: `Analyze this Fortnite match: ${description}`
-      });
+      messages.push({ role: "user", content: `Analyze this Fortnite match: ${description}` });
     }
 
+    // Add video if uploaded
     if (videoFile) {
-      // Send video as input_media instead of trying to push into messages
-      input.push({
+      const videoStream = fs.createReadStream(videoFile.path);
+      messages.push({
         role: "user",
         content: [
           { type: "input_text", text: "Analyze this gameplay video" },
-          {
-            type: "input_media",
-            media_type: "video/mp4", // assume mp4, adjust if needed
-            data: fs.readFileSync(videoFile.path).toString("base64")
-          }
+          { type: "input_video", video: videoStream }
         ]
       });
     }
 
-    const response = await client.responses.create({
-      model: "gpt-4.1",
-      input
+    if (!description && !videoFile) {
+      return res.status(400).json({ error: "No description or video provided" });
+    }
+
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: 500
     });
 
-    if (videoFile) fs.unlinkSync(videoFile.path); // cleanup temp upload
+    // Delete uploaded video if present
+    if (videoFile) fs.unlinkSync(videoFile.path);
 
-    res.json({ analysis: response.output_text });
+    res.json({ analysis: response.choices[0].message.content });
   } catch (err) {
     console.error("Analysis error:", err);
     res.status(500).json({ error: "Failed to analyze" });
