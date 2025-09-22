@@ -2,9 +2,14 @@ import express from "express";
 import OpenAI from "openai";
 import multer from "multer";
 import fs from "fs";
+import cors from "cors"; // <-- added cors
 import path from "path";
 
 const app = express();
+
+// --- CORS setup ---
+// For testing, allow all origins. For production, replace '*' with your web URL
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 const client = new OpenAI({
@@ -16,8 +21,11 @@ const upload = multer({ dest: "uploads/" });
 
 // --- Chatbot endpoint ---
 app.post("/chatbot", async (req, res) => {
+  console.log("Chatbot request body:", req.body);
   try {
-    const { message, length } = req.body; // length = "short" or "long"
+    const { message, length } = req.body;
+
+    if (!message) return res.status(400).json({ error: "Message missing" });
 
     let maxTokens = 200;
     if (length === "short") maxTokens = 100;
@@ -34,15 +42,17 @@ app.post("/chatbot", async (req, res) => {
 
     res.json({ reply: response.choices[0].message.content });
   } catch (err) {
-    console.error(err);
+    console.error("Chatbot error:", err);
     res.status(500).json({ error: "Failed to get chatbot response" });
   }
 });
 
 // --- Fortnite analyze endpoint ---
 app.post("/analyze", async (req, res) => {
+  console.log("Analyze request body:", req.body);
   try {
     const { description } = req.body;
+    if (!description) return res.status(400).json({ error: "Description missing" });
 
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
@@ -55,17 +65,18 @@ app.post("/analyze", async (req, res) => {
 
     res.json({ feedback: response.choices[0].message.content });
   } catch (err) {
-    console.error(err);
+    console.error("Analyze error:", err);
     res.status(500).json({ error: "Failed to analyze gameplay" });
   }
 });
 
 // --- Video analysis endpoint ---
 app.post("/analyze-video", upload.single("video"), async (req, res) => {
+  console.log("Video upload request:", req.file?.originalname);
   try {
-    const videoPath = req.file.path;
+    if (!req.file) return res.status(400).json({ error: "No video uploaded" });
 
-    // Convert video to a readable stream for OpenAI (if needed)
+    const videoPath = req.file.path;
     const videoStream = fs.createReadStream(videoPath);
 
     const response = await client.chat.completions.create({
@@ -83,16 +94,16 @@ app.post("/analyze-video", upload.single("video"), async (req, res) => {
       max_tokens: 500
     });
 
-    // Delete video after processing
     fs.unlinkSync(videoPath);
 
     res.json({ analysis: response.choices[0].message.content });
   } catch (err) {
-    console.error(err);
+    console.error("Video analysis error:", err);
     res.status(500).json({ error: "Failed to analyze video" });
   }
 });
 
+// --- Root endpoint ---
 app.get("/", (req, res) => {
   res.send("Fortnite AI API is running 🚀");
 });
