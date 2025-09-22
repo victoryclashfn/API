@@ -3,21 +3,37 @@ import OpenAI from "openai";
 import multer from "multer";
 import fs from "fs";
 import cors from "cors";
+import { exec } from "child_process";
 
 const app = express();
-app.use(cors()); // allow web requests
+app.use(cors());
 app.use(express.json());
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// Setup multer for file uploads
 const upload = multer({ dest: "uploads/" });
 
-// --- Chatbot endpoint (separate) ---
+// --- Helper: extract frames with ffmpeg ---
+function extractFrames(videoPath, outputDir, count = 3) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -i ${videoPath} -vf "fps=1/${Math.floor(
+      count
+    )}" ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
+    exec(cmd, (err) => {
+      if (err) return reject(err);
+      const frames = fs
+        .readdirSync(outputDir)
+        .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
+        .map((f) => `${outputDir}/${f}`);
+      resolve(frames);
+    });
+  });
+}
+
+// --- Chatbot endpoint (unchanged) ---
 app.post("/chatbot", async (req, res) => {
-  console.log("Chatbot request body:", req.body);
   try {
     const { message, length } = req.body;
     if (!message) return res.status(400).json({ error: "Message missing" });
@@ -29,7 +45,7 @@ app.post("/chatbot", async (req, res) => {
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a helpful and friendly fortnite chatbot." },
+        { role: "system", content: "You are a helpful and friendly Fortnite chatbot." },
         { role: "user", content: message }
       ],
       max_tokens: maxTokens
@@ -42,33 +58,50 @@ app.post("/chatbot", async (req, res) => {
   }
 });
 
-// --- Combined text + video analysis endpoint ---
+// --- Analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
-  console.log("Analysis request received:", req.body, req.file?.originalname);
+  console.log("Analysis request:", req.body, req.file?.originalname);
 
   try {
-    const { description } = req.body; // optional extra text
+    const { description, improve, issues, stats } = req.body; // checkbox values
     const videoFile = req.file;
-
     let messages = [
-      { role: "system", content: "You are an assistant that analyzes Fortnite/gameplay and provides insights and feedback on how to improve." }
+      {
+        role: "system",
+        content:
+          "You are an assistant that analyzes Fortnite gameplay and provides detailed, constructive feedback."
+      }
     ];
 
-    // Add text description if present
-    if (description) {
-      messages.push({ role: "user", content: `Analyze this Fortnite match: ${description}` });
-    }
+    // Build user instruction based on checkboxes
+    let checklist = [];
+    if (improve === "true") checklist.push("How to improve the gameplay");
+    if (issues === "true") checklist.push("What went wrong in the gameplay");
+    if (stats === "true") checklist.push("Player stats like accuracy, build, and edit score");
 
-    // Add video if uploaded
+    let requestText = "Analyze this Fortnite match.";
+    if (description) requestText += ` Description: ${description}`;
+    if (checklist.length > 0) requestText += ` Focus on: ${checklist.join(", ")}.`;
+
+    messages.push({ role: "user", content: requestText });
+
+    // If video uploaded → extract frames and add them
+    let framePaths = [];
     if (videoFile) {
-      const videoStream = fs.createReadStream(videoFile.path);
-      messages.push({
-        role: "user",
-        content: [
-          { type: "input_text", text: "Analyze this gameplay video" },
-          { type: "input_video", video: videoStream }
-        ]
-      });
+      const frameDir = `uploads/frames-${Date.now()}`;
+      fs.mkdirSync(frameDir);
+      framePaths = await extractFrames(videoFile.path, frameDir, 3);
+
+      for (const frame of framePaths) {
+        const b64 = fs.readFileSync(frame, { encoding: "base64" });
+        messages.push({
+          role: "user",
+          content: [
+            { type: "input_text", text: "Frame from gameplay video" },
+            { type: "input_image", image_url: `data:image/png;base64,${b64}` }
+          ]
+        });
+      }
     }
 
     if (!description && !videoFile) {
@@ -78,11 +111,16 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
-      max_tokens: 500
+      max_tokens: 600
     });
 
-    // Delete uploaded video if present
-    if (videoFile) fs.unlinkSync(videoFile.path);
+    // Cleanup files
+    try {
+      if (videoFile) fs.unlinkSync(videoFile.path);
+      for (const frame of framePaths) fs.unlinkSync(frame);
+    } catch (e) {
+      console.error("Cleanup error:", e);
+    }
 
     res.json({ analysis: response.choices[0].message.content });
   } catch (err) {
