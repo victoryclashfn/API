@@ -18,9 +18,8 @@ const upload = multer({ dest: "uploads/" });
 // --- Helper: extract frames with ffmpeg ---
 function extractFrames(videoPath, outputDir, count = 3) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -i ${videoPath} -vf "fps=1/${Math.floor(
-      count
-    )}" ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
+    // evenly sample <count> frames, scaled down to 640x360
+    const cmd = `ffmpeg -i ${videoPath} -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
       const frames = fs
@@ -52,7 +51,7 @@ app.post("/chatbot", async (req, res) => {
     });
 
     let reply = response.choices[0].message.content || "";
-    reply = reply.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
+    reply = reply.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n");
 
     res.json({ reply });
   } catch (err) {
@@ -72,6 +71,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     return res.status(400).json({ error: "No description or video provided" });
   }
 
+  let framePaths = [];
   try {
     let messages = [
       {
@@ -97,7 +97,6 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     messages.push({ role: "user", content: requestText });
 
     // If video uploaded → extract frames and add them
-    let framePaths = [];
     if (videoFile) {
       try {
         const frameDir = `uploads/frames-${Date.now()}`;
@@ -123,7 +122,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     let response;
     try {
       response = await client.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-4o", // <-- switched to gpt-4o for multimodal
         messages,
         max_tokens: 600
       });
@@ -132,21 +131,21 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       return res.status(500).json({ error: "Failed to generate analysis" });
     }
 
-    // Cleanup files
+    let analysis = response.choices[0].message.content || "";
+    analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n");
+
+    res.json({ analysis });
+  } catch (err) {
+    console.error("Analysis error:", err);
+    res.status(500).json({ error: "Failed to analyze" });
+  } finally {
+    // Cleanup in all cases
     try {
       if (videoFile) fs.unlinkSync(videoFile.path);
       for (const frame of framePaths) fs.unlinkSync(frame);
     } catch (cleanupErr) {
       console.error("Cleanup error:", cleanupErr);
     }
-
-    let analysis = response.choices[0].message.content || "";
-    analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
-
-    res.json({ analysis });
-  } catch (err) {
-    console.error("Analysis error:", err);
-    res.status(500).json({ error: "Failed to analyze" });
   }
 });
 
