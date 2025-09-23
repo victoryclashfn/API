@@ -1,9 +1,9 @@
-=import express from "express";
-import OpenAI from "openai";
-import multer from "multer";
-import fs from "fs";
-import cors from "cors";
-import { exec } from "child_process";
+const express = require("express");
+const OpenAI = require("openai");
+const multer = require("multer");
+const fs = require("fs");
+const cors = require("cors");
+const { exec } = require("child_process");
 
 const app = express();
 app.use(cors());
@@ -32,7 +32,7 @@ function extractFrames(videoPath, outputDir, count = 3) {
   });
 }
 
-// --- Chatbot endpoint ---
+// --- Chatbot endpoint (unchanged) ---
 app.post("/chatbot", async (req, res) => {
   try {
     const { message, length } = req.body;
@@ -51,10 +51,8 @@ app.post("/chatbot", async (req, res) => {
       max_tokens: maxTokens
     });
 
-    let reply = response.choices[0].message.content || "";
-    reply = reply.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
-
-    res.json({ reply });
+    let cleanReply = response.choices[0].message.content.replace(/\*/g, "");
+    res.json({ reply: cleanReply });
   } catch (err) {
     console.error("Chatbot error:", err);
     res.status(500).json({ error: "Failed to get chatbot response" });
@@ -65,19 +63,15 @@ app.post("/chatbot", async (req, res) => {
 app.post("/analyze", upload.single("video"), async (req, res) => {
   console.log("Analysis request:", req.body, req.file?.originalname);
 
-  const { description, improvementTips, mistakeOverview, statistics } = req.body;
-  const videoFile = req.file;
-
-  if (!description && !videoFile) {
-    return res.status(400).json({ error: "No description or video provided" });
-  }
-
   try {
+    const { description, improvementTips, mistakeOverview, statistics } = req.body;
+    const videoFile = req.file;
+
     let messages = [
       {
         role: "system",
         content:
-          "You are an assistant that analyzes Fortnite gameplay and provides detailed, constructive feedback."
+          "You are an assistant that analyzes Fortnite gameplay and provides detailed, constructive feedback. Never use asterisks (*). Format the response with clear paragraphs and bullet points if needed."
       }
     ];
 
@@ -99,51 +93,43 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     // If video uploaded → extract frames and add them
     let framePaths = [];
     if (videoFile) {
-      try {
-        const frameDir = `uploads/frames-${Date.now()}`;
-        fs.mkdirSync(frameDir);
-        framePaths = await extractFrames(videoFile.path, frameDir, 3);
+      const frameDir = `uploads/frames-${Date.now()}`;
+      fs.mkdirSync(frameDir);
+      framePaths = await extractFrames(videoFile.path, frameDir, 3);
 
-        for (const frame of framePaths) {
-          const b64 = fs.readFileSync(frame, { encoding: "base64" });
-          messages.push({
-            role: "user",
-            content: [
-              { type: "text", text: "Frame from gameplay video" },
-              { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } }
-            ]
-          });
-        }
-      } catch (ffmpegErr) {
-        console.error("FFmpeg error:", ffmpegErr);
-        return res.status(500).json({ error: "Failed to process video frames" });
+      for (const frame of framePaths) {
+        const b64 = fs.readFileSync(frame, { encoding: "base64" });
+        messages.push({
+          role: "user",
+          content: [
+            { type: "input_text", text: "Frame from gameplay video" },
+            { type: "input_image", image_url: `data:image/png;base64,${b64}` }
+          ]
+        });
       }
     }
 
-    let response;
-    try {
-      response = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages,
-        max_tokens: 600
-      });
-    } catch (openaiErr) {
-      console.error("OpenAI API error:", openaiErr);
-      return res.status(500).json({ error: "Failed to generate analysis" });
+    if (!description && !videoFile) {
+      return res.status(400).json({ error: "No description or video provided" });
     }
+
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: 600
+    });
+
+    let cleanAnalysis = response.choices[0].message.content.replace(/\*/g, "");
 
     // Cleanup files
     try {
       if (videoFile) fs.unlinkSync(videoFile.path);
       for (const frame of framePaths) fs.unlinkSync(frame);
-    } catch (cleanupErr) {
-      console.error("Cleanup error:", cleanupErr);
+    } catch (e) {
+      console.error("Cleanup error:", e);
     }
 
-    let analysis = response.choices[0].message.content || "";
-    analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
-
-    res.json({ analysis });
+    res.json({ analysis: cleanAnalysis });
   } catch (err) {
     console.error("Analysis error:", err);
     res.status(500).json({ error: "Failed to analyze" });
