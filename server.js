@@ -18,7 +18,6 @@ const upload = multer({ dest: "uploads/" });
 // --- Helper: extract frames with ffmpeg ---
 function extractFrames(videoPath, outputDir, count = 3) {
   return new Promise((resolve, reject) => {
-    // evenly sample <count> frames, scaled down to 640x360
     const cmd = `ffmpeg -i ${videoPath} -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
@@ -81,7 +80,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       }
     ];
 
-    // Build user instruction based on checkboxes
+    // Build checklist instructions
     let checklist = [];
     if (improvementTips === "true" || improvementTips === true)
       checklist.push("Give specific improvement tips.");
@@ -94,9 +93,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     if (description) requestText += ` Description: ${description}`;
     if (checklist.length > 0) requestText += ` Focus on: ${checklist.join(" ")}`;
 
-    messages.push({ role: "user", content: requestText });
-
-    // If video uploaded → extract frames and add them
+    // Try to process video frames (optional)
     if (videoFile) {
       try {
         const frameDir = `uploads/frames-${Date.now()}`;
@@ -114,22 +111,20 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
           });
         }
       } catch (ffmpegErr) {
-        console.error("FFmpeg error:", ffmpegErr);
-        return res.status(500).json({ error: "Failed to process video frames" });
+        console.error("FFmpeg error (falling back to description):", ffmpegErr);
+        // Continue using description only
       }
     }
 
-    let response;
-    try {
-      response = await client.chat.completions.create({
-        model: "gpt-4o", // <-- switched to gpt-4o for multimodal
-        messages,
-        max_tokens: 600
-      });
-    } catch (openaiErr) {
-      console.error("OpenAI API error:", openaiErr);
-      return res.status(500).json({ error: "Failed to generate analysis" });
-    }
+    // Always include the description text
+    messages.push({ role: "user", content: requestText });
+
+    // Send request to OpenAI
+    let response = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages,
+      max_tokens: 600
+    });
 
     let analysis = response.choices[0].message.content || "";
     analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n");
@@ -139,7 +134,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     console.error("Analysis error:", err);
     res.status(500).json({ error: "Failed to analyze" });
   } finally {
-    // Cleanup in all cases
+    // Cleanup uploaded video & frames
     try {
       if (videoFile) fs.unlinkSync(videoFile.path);
       for (const frame of framePaths) fs.unlinkSync(frame);
@@ -149,10 +144,12 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
   }
 });
 
+// --- Root endpoint ---
 app.get("/", (req, res) => {
   res.send("Fortnite AI API is running 🚀");
 });
 
+// --- Start server ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
