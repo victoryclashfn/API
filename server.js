@@ -1,4 +1,4 @@
-import express from "express";
+=import express from "express";
 import OpenAI from "openai";
 import multer from "multer";
 import fs from "fs";
@@ -32,7 +32,7 @@ function extractFrames(videoPath, outputDir, count = 3) {
   });
 }
 
-// --- Chatbot endpoint (unchanged) ---
+// --- Chatbot endpoint ---
 app.post("/chatbot", async (req, res) => {
   try {
     const { message, length } = req.body;
@@ -51,7 +51,10 @@ app.post("/chatbot", async (req, res) => {
       max_tokens: maxTokens
     });
 
-    res.json({ reply: response.choices[0].message.content });
+    let reply = response.choices[0].message.content || "";
+    reply = reply.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
+
+    res.json({ reply });
   } catch (err) {
     console.error("Chatbot error:", err);
     res.status(500).json({ error: "Failed to get chatbot response" });
@@ -62,10 +65,14 @@ app.post("/chatbot", async (req, res) => {
 app.post("/analyze", upload.single("video"), async (req, res) => {
   console.log("Analysis request:", req.body, req.file?.originalname);
 
-  try {
-    const { description, improvementTips, mistakeOverview, statistics } = req.body;
-    const videoFile = req.file;
+  const { description, improvementTips, mistakeOverview, statistics } = req.body;
+  const videoFile = req.file;
 
+  if (!description && !videoFile) {
+    return res.status(400).json({ error: "No description or video provided" });
+  }
+
+  try {
     let messages = [
       {
         role: "system",
@@ -92,41 +99,51 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     // If video uploaded → extract frames and add them
     let framePaths = [];
     if (videoFile) {
-      const frameDir = `uploads/frames-${Date.now()}`;
-      fs.mkdirSync(frameDir);
-      framePaths = await extractFrames(videoFile.path, frameDir, 3);
+      try {
+        const frameDir = `uploads/frames-${Date.now()}`;
+        fs.mkdirSync(frameDir);
+        framePaths = await extractFrames(videoFile.path, frameDir, 3);
 
-      for (const frame of framePaths) {
-        const b64 = fs.readFileSync(frame, { encoding: "base64" });
-        messages.push({
-          role: "user",
-          content: [
-            { type: "input_text", text: "Frame from gameplay video" },
-            { type: "input_image", image_url: `data:image/png;base64,${b64}` }
-          ]
-        });
+        for (const frame of framePaths) {
+          const b64 = fs.readFileSync(frame, { encoding: "base64" });
+          messages.push({
+            role: "user",
+            content: [
+              { type: "text", text: "Frame from gameplay video" },
+              { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } }
+            ]
+          });
+        }
+      } catch (ffmpegErr) {
+        console.error("FFmpeg error:", ffmpegErr);
+        return res.status(500).json({ error: "Failed to process video frames" });
       }
     }
 
-    if (!description && !videoFile) {
-      return res.status(400).json({ error: "No description or video provided" });
+    let response;
+    try {
+      response = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        max_tokens: 600
+      });
+    } catch (openaiErr) {
+      console.error("OpenAI API error:", openaiErr);
+      return res.status(500).json({ error: "Failed to generate analysis" });
     }
-
-    const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      max_tokens: 600
-    });
 
     // Cleanup files
     try {
       if (videoFile) fs.unlinkSync(videoFile.path);
       for (const frame of framePaths) fs.unlinkSync(frame);
-    } catch (e) {
-      console.error("Cleanup error:", e);
+    } catch (cleanupErr) {
+      console.error("Cleanup error:", cleanupErr);
     }
 
-    res.json({ analysis: response.choices[0].message.content });
+    let analysis = response.choices[0].message.content || "";
+    analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n"); // clean formatting
+
+    res.json({ analysis });
   } catch (err) {
     console.error("Analysis error:", err);
     res.status(500).json({ error: "Failed to analyze" });
