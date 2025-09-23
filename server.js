@@ -63,8 +63,9 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
   console.log("Analysis request:", req.body, req.file?.originalname);
 
   try {
-    const { description, improve, issues, stats } = req.body; // checkbox values
+    const { description, improvementTips, mistakeOverview, statistics } = req.body;
     const videoFile = req.file;
+
     let messages = [
       {
         role: "system",
@@ -75,13 +76,16 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
 
     // Build user instruction based on checkboxes
     let checklist = [];
-    if (improve === "true") checklist.push("How to improve the gameplay");
-    if (issues === "true") checklist.push("What went wrong in the gameplay");
-    if (stats === "true") checklist.push("Player stats like accuracy, build, and edit score");
+    if (improvementTips === "true" || improvementTips === true)
+      checklist.push("Give specific improvement tips.");
+    if (mistakeOverview === "true" || mistakeOverview === true)
+      checklist.push("List mistakes and how to avoid them.");
+    if (statistics === "true" || statistics === true)
+      checklist.push("Provide gameplay statistics like accuracy, building efficiency, and editing speed.");
 
     let requestText = "Analyze this Fortnite match.";
     if (description) requestText += ` Description: ${description}`;
-    if (checklist.length > 0) requestText += ` Focus on: ${checklist.join(", ")}.`;
+    if (checklist.length > 0) requestText += ` Focus on: ${checklist.join(" ")}`;
 
     messages.push({ role: "user", content: requestText });
 
