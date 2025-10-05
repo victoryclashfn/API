@@ -6,8 +6,10 @@ import cors from "cors";
 import { exec } from "child_process";
 import admin from "firebase-admin";
 
-// --- Firebase Setup ---
-import serviceAccount from "./serviceAccountKey.json" assert { type: "json" };
+// --- Firebase Setup (Option 1: fs.readFileSync) ---
+const serviceAccount = JSON.parse(
+  fs.readFileSync("./serviceAccountKey.json", "utf8")
+);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -145,7 +147,9 @@ app.post("/chatbot", async (req, res) => {
     if (!userId || !message)
       return res.status(400).json({ error: "userId and message required" });
 
-    const combinedBio = bio ? await mergeBio(userId, bio) : (await db.collection("bios").doc(userId).get()).data()?.bio || "";
+    const combinedBio = bio
+      ? await mergeBio(userId, bio)
+      : (await db.collection("bios").doc(userId).get()).data()?.bio || "";
 
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
