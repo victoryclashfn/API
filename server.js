@@ -2,196 +2,177 @@ import express from "express";
 import OpenAI from "openai";
 import multer from "multer";
 import fs from "fs";
-import fsp from "fs/promises";
-import path from "path";
 import cors from "cors";
-import { spawn } from "child_process";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
+import { exec } from "child_process";
+import admin from "firebase-admin";
 
-// --- Config ---
-const UPLOAD_DIR = path.resolve("./uploads");
-const FRAME_SAMPLE_COUNT = 8; // increased frame samples for better analysis
-const DB_PATH = path.join(UPLOAD_DIR, "fortnite.db");
+// --- Firebase Setup ---
+import serviceAccount from "./serviceAccountKey.json" assert { type: "json" };
 
-// --- Initialize OpenAI ---
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
 
-// --- Express setup ---
+// --- Express App ---
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json());
 
-// --- Initialize SQLite DB ---
-let db;
-async function initDB() {
-  await fsp.mkdir(UPLOAD_DIR, { recursive: true });
-  db = await open({ filename: DB_PATH, driver: sqlite3.Database });
-  await db.run(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, bio TEXT)`);
-  await db.run(`CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, userId TEXT, timestamp INTEGER, analysis TEXT)`);
-}
-
-// --- Merge Bio Function ---
-function mergeBioText(oldBio = "", newBio = "", maxLen = 4000) {
-  if (!oldBio) return newBio || "";
-  if (!newBio) return oldBio || "";
-  const splitSentences = (text) => text.split(/(?<=[.?!])\s+/).map(s => s.trim()).filter(Boolean);
-  const sentences = [...splitSentences(oldBio), ...splitSentences(newBio)];
-  const seen = new Set();
-  const merged = [];
-  for (const s of sentences) {
-    const key = s.toLowerCase();
-    if (!seen.has(key)) {
-      merged.push(s);
-      seen.add(key);
-    }
-  }
-  let result = merged.join(" ");
-  if (result.length > maxLen) {
-    const reversed = merged.reverse();
-    let truncated = "";
-    for (const s of reversed) {
-      if ((truncated + " " + s).length > maxLen) break;
-      truncated = (truncated + " " + s).trim();
-    }
-    result = truncated;
-  }
-  return result;
-}
-
-// --- Multer for video uploads ---
-const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 200 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith("video/")) return cb(new Error("Only video uploads allowed"));
-    cb(null, true);
-  }
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
-// --- FFmpeg frame extraction ---
-async function extractFrames(videoPath, outputDir, count = FRAME_SAMPLE_COUNT) {
-  await fsp.mkdir(outputDir, { recursive: true });
+const upload = multer({ dest: "uploads/" });
+
+// --- Helper: Extract frames ---
+function extractFrames(videoPath, outputDir, count = 3) {
   return new Promise((resolve, reject) => {
-    const outPattern = path.join(outputDir, "frame-%02d.png");
-    const args = ["-y", "-i", videoPath, "-vf", "thumbnail,scale=640:360", "-frames:v", String(count), outPattern, "-hide_banner", "-loglevel", "error"];
-    const ff = spawn("ffmpeg", args);
-    let stderr = "";
-    ff.stderr.on("data", (d) => (stderr += d.toString()));
-    ff.on("error", reject);
-    ff.on("close", async (code) => {
-      if (code !== 0) return reject(new Error("ffmpeg failed: " + stderr));
-      try {
-        const files = await fsp.readdir(outputDir);
-        const frames = files.filter(f => f.startsWith("frame-") && f.endsWith(".png")).map(f => path.join(outputDir, f));
-        resolve(frames);
-      } catch (e) { reject(e); }
+    const cmd = `ffmpeg -i ${videoPath} -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
+    exec(cmd, (err) => {
+      if (err) return reject(err);
+      const frames = fs
+        .readdirSync(outputDir)
+        .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
+        .map((f) => `${outputDir}/${f}`);
+      resolve(frames);
     });
   });
 }
 
-// --- Build system prompt ---
-function buildSystemPrompt(responseType) {
-  return (`You are an expert Fortnite analyst. Response type: ${responseType}. Produce a single JSON object with fields: type, summary, mistakes[], improvements[], stats{accuracy, buildingEfficiency, editingSpeed}, framesAnalyzedCount. If a field is not applicable, return null or empty array/object.`);
+// --- Helper: Merge bio in Firestore ---
+async function mergeBio(userId, newBio) {
+  const ref = db.collection("bios").doc(userId);
+  const doc = await ref.get();
+  let combined = newBio;
+  if (doc.exists) {
+    combined = doc.data().bio + " " + newBio;
+  }
+  await ref.set({ bio: combined }, { merge: true });
+  return combined;
 }
 
-function tryParseJsonFromText(text) {
-  if (!text || typeof text !== "string") return null;
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  const jsonText = text.slice(start, end + 1);
-  try { return JSON.parse(jsonText); } catch (e) { return null; }
+// --- Generate prompt style based on type ---
+function buildPrompt(responseType) {
+  switch (responseType?.toLowerCase()) {
+    case "coach":
+      return "Act like a Fortnite coach. Give constructive, step-by-step advice.";
+    case "stats":
+      return "Provide raw gameplay statistics and performance breakdowns.";
+    case "summary":
+      return "Give a short, neutral match summary.";
+    case "hype":
+      return "Respond like a hype caster. Make it energetic and fun.";
+    case "analytics":
+      return "Provide a detailed, analytical breakdown of the gameplay.";
+    default:
+      return "Be a helpful Fortnite assistant.";
+  }
 }
 
-// --- Analyze endpoint ---
+// --- Analyze Endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
+  console.log("Analysis request:", req.body, req.file?.originalname);
+
+  const { userId, bio, responseType } = req.body;
   const videoFile = req.file;
-  const { userId, bio: newBio, responseType = "analytics", length = "medium" } = req.body;
-  const allowed = ["couch","stats","summary","hype","analytics"];
-  if (!allowed.includes(responseType)) return res.status(400).json({ error: `responseType must be one of ${allowed.join(", ")}` });
 
+  if (!userId) return res.status(400).json({ error: "userId is required" });
+  if (!bio && !videoFile)
+    return res.status(400).json({ error: "Bio or video required" });
+
+  let framePaths = [];
   try {
-    let mergedBio = newBio || "";
-    if (userId) {
-      const userRow = await db.get("SELECT bio FROM users WHERE id = ?", userId);
-      const existingBio = userRow?.bio || "";
-      mergedBio = mergeBioText(existingBio, newBio || "");
-      await db.run("INSERT INTO users (id, bio) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET bio=excluded.bio", userId, mergedBio);
-    }
+    // Merge bio into Firestore
+    const combinedBio = bio ? await mergeBio(userId, bio) : "";
 
-    const messages = [{ role: "system", content: buildSystemPrompt(responseType) }];
-    let framePaths = [];
+    // Build request text
+    const promptIntro = buildPrompt(responseType);
+    let requestText = `${promptIntro}\nPlayer Bio: ${combinedBio}\nAnalyze this Fortnite gameplay.`;
+
+    let messages = [{ role: "system", content: requestText }];
+
+    // Process video frames
     if (videoFile) {
-      const framesDir = path.join(UPLOAD_DIR, `frames-${Date.now()}`);
       try {
-        framePaths = await extractFrames(videoFile.path, framesDir, FRAME_SAMPLE_COUNT);
-        for (let i = 0; i < framePaths.length; i++) {
-          const b64 = await fsp.readFile(framePaths[i], { encoding: "base64" });
-          messages.push({ role: "user", content: [ { type: "text", text: `Frame ${i+1}` }, { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } } ] });
+        const frameDir = `uploads/frames-${Date.now()}`;
+        fs.mkdirSync(frameDir);
+        framePaths = await extractFrames(videoFile.path, frameDir, 3);
+
+        for (const frame of framePaths) {
+          const b64 = fs.readFileSync(frame, { encoding: "base64" });
+          messages.push({
+            role: "user",
+            content: [
+              { type: "text", text: "Frame from gameplay video" },
+              { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } }
+            ]
+          });
         }
-      } catch (e) { console.error("Frame extraction failed:", e); }
+      } catch (ffmpegErr) {
+        console.error("FFmpeg error:", ffmpegErr);
+      }
     }
 
-    if (mergedBio) messages.push({ role: "user", content: `Player bio/context: ${mergedBio}` });
-    const maxTokens = length === "short" ? 400 : length === "long" ? 2000 : 1200;
+    // Request to OpenAI
+    const response = await client.chat.completions.create({
+      model: "gpt-4o",
+      messages,
+      max_tokens: 600
+    });
 
-    messages.push({ role: "user", content: `Please analyze using the "${responseType}" style and return JSON.` });
-    const analysisResp = await client.chat.completions.create({ model: "gpt-4o", messages, max_tokens: maxTokens, temperature: 0.2 });
-    let analysisJson = tryParseJsonFromText(analysisResp.choices?.[0]?.message?.content || "") || { raw: analysisResp.choices?.[0]?.message?.content || "" };
+    let analysis = response.choices[0].message.content || "";
+    analysis = analysis.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n");
 
-    // Save match history
-    if (userId) {
-      await db.run("INSERT INTO matches (userId, timestamp, analysis) VALUES (?, ?, ?)", userId, Date.now(), JSON.stringify(analysisJson));
-    }
-
-    // Bio summary
-    let bioSummary = null;
-    if (mergedBio) {
-      const bioSystem = `You are a Fortnite analyst. Produce a 'stats' style JSON object summarizing this player's bio/context.`;
-      const bioResp = await client.chat.completions.create({ model: "gpt-4o", messages: [{ role: "system", content: bioSystem }, { role: "user", content: `Player bio: ${mergedBio}` }], max_tokens: 400, temperature: 0.1 });
-      bioSummary = tryParseJsonFromText(bioResp.choices?.[0]?.message?.content || "") || { raw: bioResp.choices?.[0]?.message?.content || "" };
-    }
-
-    res.json({ ok: true, userId: userId || null, mergedBio: mergedBio || null, framesAnalyzed: framePaths.length, analysis: analysisJson, bioSummary });
+    res.json({ analysis });
   } catch (err) {
-    console.error("/analyze error:", err);
-    res.status(500).json({ error: "Failed to analyze", details: err?.message || String(err) });
+    console.error("Analysis error:", err);
+    res.status(500).json({ error: "Failed to analyze" });
   } finally {
-    (async () => { try { if (req.file?.path) await fsp.unlink(req.file.path).catch(()=>{}); } catch{} })();
-  }
-});
-
-// --- Chatbot endpoint ---
-app.post("/chatbot", async (req, res) => {
-  const { userId, bio: newBio, message } = req.body;
-  if (!message) return res.status(400).json({ error: "Message required" });
-  try {
-    let mergedBio = newBio || "";
-    if (userId) {
-      const userRow = await db.get("SELECT bio FROM users WHERE id=?", userId);
-      const existingBio = userRow?.bio || "";
-      mergedBio = mergeBioText(existingBio, newBio || "");
-      await db.run("INSERT INTO users (id, bio) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET bio=excluded.bio", userId, mergedBio);
+    try {
+      if (videoFile) fs.unlinkSync(videoFile.path);
+      for (const frame of framePaths) fs.unlinkSync(frame);
+    } catch (cleanupErr) {
+      console.error("Cleanup error:", cleanupErr);
     }
-
-    const systemContent = `You are a friendly Fortnite chatbot using player's bio to inform responses.`;
-    const messages = [{ role: "system", content: systemContent }];
-    if (mergedBio) messages.push({ role: "user", content: `Player bio/context: ${mergedBio}` });
-    messages.push({ role: "user", content: message });
-
-    const resp = await client.chat.completions.create({ model: "gpt-4o-mini", messages, max_tokens: 400, temperature: 0.6 });
-    const reply = resp.choices?.[0]?.message?.content || "";
-    res.json({ ok: true, reply, mergedBio });
-  } catch (err) {
-    console.error("/chatbot error:", err);
-    res.status(500).json({ error: "Chatbot failed", details: err?.message || String(err) });
   }
 });
 
-// --- Healthcheck ---
-app.get("/", (req, res) => res.send("Fortnite AI API running - use /analyze and /chatbot"));
+// --- Chatbot Endpoint ---
+app.post("/chatbot", async (req, res) => {
+  try {
+    const { userId, bio, message } = req.body;
+    if (!userId || !message)
+      return res.status(400).json({ error: "userId and message required" });
 
-// --- Start server ---
+    const combinedBio = bio ? await mergeBio(userId, bio) : (await db.collection("bios").doc(userId).get()).data()?.bio || "";
+
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: `You are a Fortnite chatbot. Player Bio: ${combinedBio}` },
+        { role: "user", content: message }
+      ],
+      max_tokens: 300
+    });
+
+    let reply = response.choices[0].message.content || "";
+    reply = reply.replace(/\*/g, "").replace(/\n{2,}/g, "\n\n");
+
+    res.json({ reply });
+  } catch (err) {
+    console.error("Chatbot error:", err);
+    res.status(500).json({ error: "Failed to get chatbot response" });
+  }
+});
+
+// --- Root Endpoint ---
+app.get("/", (req, res) => {
+  res.send("🎮 Fortnite AI API running!");
+});
+
+// --- Start Server ---
 const port = process.env.PORT || 3000;
-initDB().then(() => { app.listen(port, () => console.log(`Server listening on port ${port}`)); });
+app.listen(port, () => {
+  console.log(`✅ Server running on port ${port}`);
+});
