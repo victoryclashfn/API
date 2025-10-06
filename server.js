@@ -32,6 +32,15 @@ function summarizeFrames(frames) {
   return `Extracted ${frames.length} frames from the gameplay video for analysis.`;
 }
 
+// --- Helper: Apply strict dynamic spacing ---
+function applyDynamicSpacing(text) {
+  // Ensure at least one blank line between categories/tips
+  let spaced = text.replace(/\n\s*\n/g, "\n\n"); // normalize existing blank lines
+  spaced = spaced.replace(/([^\n])\n([^\n])/g, "$1\n\n$2"); // add blank line between single lines
+  spaced = spaced.replace(/\n{3,}/g, "\n\n"); // limit to max 2 consecutive line breaks
+  return spaced.trim();
+}
+
 // --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
   const { bio, focus, responseType } = req.body;
@@ -171,6 +180,9 @@ Format Rules:
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
+    // --- Apply strict dynamic spacing ---
+    cleanText = applyDynamicSpacing(cleanText);
+
     return res.json({
       success: true,
       analysis: cleanText,
@@ -186,7 +198,7 @@ Format Rules:
 
 // --- Root Route ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running with dynamic formatting and spacing!");
+  res.send("🎮 Fortnite AI API running with dynamic formatting and enforced spacing!");
 });
 
 // --- Start Server ---
