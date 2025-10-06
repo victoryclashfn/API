@@ -92,31 +92,43 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
 Respond with numeric scores (out of 10) only.
 Example:
 Aiming: 8/10
+
 Building: 7/10
+
 Positioning: 6/10
+
 Overall: 7/10`;
         break;
       case "improvement":
         responsePrompt = `
 Focus only on improvement tips and step-by-step advice.
+Add spacing between tips for readability.
 Example:
+
 1. Improve your crosshair placement.
+
 2. Practice edits daily.
+
 3. Work on early-game positioning.`;
         break;
       case "coach":
         responsePrompt = `
 Respond like a professional Fortnite coach.
 Use paragraphs and motivational tone.
+Add blank lines between sections for readability.
 Example:
-“You’ve built solid aim fundamentals, but your mid-fight edits could be smoother...”`;
+
+“You’ve built solid aim fundamentals, but your mid-fight edits could be smoother...
+
+Keep practicing your rotations to maintain map control.”`;
         break;
       case "summary":
         responsePrompt = `
-Provide a short summary (2–3 sentences) of the player's performance.`;
+Provide a short summary (2–3 sentences) of the player's performance.
+Add spacing between sentences for clarity.`;
         break;
       default:
-        responsePrompt = "Provide clear, general gameplay feedback.";
+        responsePrompt = "Provide clear, general gameplay feedback with proper spacing.";
     }
 
     // --- AI Prompt ---
@@ -132,7 +144,7 @@ Response type: ${responsePrompt}
 
 Format Rules:
 - Write clean, readable text only.
-- Add newlines between each category or section.
+- Add extra spacing between sections, categories, or tips dynamically for clarity.
 - Never use *, {}, [], #, **, or \`\`\`.
 - Keep the formatting natural and easy to read inside a text box.
 `;
@@ -174,7 +186,7 @@ Format Rules:
 
 // --- Root Route ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running with dynamic formatting!");
+  res.send("🎮 Fortnite AI API running with dynamic formatting and spacing!");
 });
 
 // --- Start Server ---
