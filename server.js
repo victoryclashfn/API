@@ -63,61 +63,79 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
   }
 
   try {
-    // --- Focus type handling ---
+    // --- Focus Prompt ---
     let focusPrompt = "";
     switch (focus.toLowerCase()) {
       case "aim":
-        focusPrompt = "Focus mainly on aiming and shooting accuracy.";
+        focusPrompt = "Focus mainly on aiming, shooting accuracy, and tracking.";
         break;
       case "building":
-        focusPrompt = "Focus mainly on building, edits, and structural plays.";
+        focusPrompt = "Focus on building speed, edits, and structure control.";
         break;
       case "positioning":
-        focusPrompt = "Focus mainly on positioning, rotations, and awareness.";
+        focusPrompt = "Focus on positioning, rotations, and awareness.";
         break;
       case "all":
       case "gameplay":
-        focusPrompt =
-          "Analyze everything: aim, positioning, building, edits, and overall gameplay.";
+        focusPrompt = "Analyze everything: aim, building, edits, positioning, and overall gameplay.";
         break;
       default:
-        focusPrompt = "Provide general gameplay analysis.";
+        focusPrompt = "Provide a general gameplay analysis.";
     }
 
-    // --- Response type handling ---
+    // --- Response Type Prompt ---
     let responsePrompt = "";
     switch (responseType.toLowerCase()) {
       case "stats":
-        responsePrompt = "Provide numeric ratings (out of 10) for each area.";
+        responsePrompt = `
+Respond with numeric scores (out of 10) and short feedback lines.
+Example:
+Aiming: 8/10
+Building: 7/10
+Positioning: 6/10
+Overall: 7/10
+Quick Feedback: Short advice on improvement.`;
         break;
       case "improvement":
-        responsePrompt = "Give detailed improvement advice.";
+        responsePrompt = `
+Focus only on improvement tips and step-by-step advice.
+Example:
+1. Improve your crosshair placement.
+2. Practice edits daily.
+3. Work on early-game positioning.`;
         break;
       case "coach":
-        responsePrompt = "Respond like a professional Fortnite coach.";
+        responsePrompt = `
+Respond like a professional Fortnite coach.
+Use paragraphs and motivational tone.
+Example:
+“You’ve built solid aim fundamentals, but your mid-fight edits could be smoother...”`;
         break;
       case "summary":
-        responsePrompt = "Provide a concise gameplay summary.";
+        responsePrompt = `
+Provide a short summary (2–3 sentences) of the player's performance.`;
         break;
       default:
-        responsePrompt = "Provide general gameplay feedback.";
+        responsePrompt = "Provide clear, general gameplay feedback.";
     }
 
-    // --- Full prompt for AI ---
+    // --- AI Prompt ---
     const analysisPrompt = `
 You are a professional Fortnite gameplay analyst.
 
-Analyze this player based on the following:
+Analyze this player:
 Bio: ${bio}
 Video Summary: ${frameSummary}
 Focus: ${focusPrompt}
-Response Type: ${responsePrompt}
 
-Rules:
-- Respond ONLY in plain text (no JSON, no lists, no *, no quotes, no brackets).
-- Do NOT use markdown formatting like \`\`\` or **.
-- Write naturally like you're talking to the player.
-    `;
+Response type: ${responsePrompt}
+
+Format Rules:
+- Write clean, readable text only.
+- Add newlines between each category or section.
+- Never use *, {}, [], #, **, or \`\`\`.
+- Keep the formatting natural and easy to read inside a text box.
+`;
 
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -125,20 +143,20 @@ Rules:
         {
           role: "system",
           content:
-            "You are a Fortnite gameplay coach. Always reply in clean human-readable text. Never use *, {}, or ```.",
+            "You are a Fortnite gameplay coach. Always return plain, formatted text only — no JSON, Markdown, or symbols.",
         },
         { role: "user", content: analysisPrompt },
       ],
     });
 
-    // --- Cleanup output ---
+    // --- Cleanup ---
     let cleanText = aiResponse.choices[0].message.content.trim();
 
     cleanText = cleanText
-      .replace(/```[\s\S]*?```/g, "") // remove code blocks
-      .replace(/[{}[\]"*]/g, "") // remove brackets, stars, quotes
-      .replace(/feedback:/gi, "")
-      .replace(/\s+/g, " ")
+      .replace(/```[\s\S]*?```/g, "")
+      .replace(/[{}[\]*#"]/g, "")
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
       .trim();
 
     return res.json({
@@ -154,12 +172,12 @@ Rules:
   }
 });
 
-// --- Root route ---
+// --- Root Route ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running!");
+  res.send("🎮 Fortnite AI API running with dynamic formatting!");
 });
 
-// --- Start server ---
+// --- Start Server ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`✅ Server running on port ${port}`);
