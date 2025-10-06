@@ -1,18 +1,16 @@
 // server.js
 import express from "express";
-import multer from "multer";
 import fs from "fs";
 import { exec } from "child_process";
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// --- Multer setup ---
-const upload = multer({ dest: "uploads/" });
-
-// --- Helper: Extract frames from video ---
-function extractFrames(videoPath, outputDir, count = 3) {
+// --- Optional helper if you later want to extract frames from the video URL ---
+function extractFramesFromUrl(videoUrl, outputDir, count = 3) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
+    const cmd = `ffmpeg -i "${videoUrl}" -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
       const frames = fs
@@ -24,69 +22,58 @@ function extractFrames(videoPath, outputDir, count = 3) {
   });
 }
 
-// --- Analyze Endpoint ---
-app.post(
-  "/analyze",
-  upload.fields([
-    { name: "video", maxCount: 1 },
-    { name: "bio", maxCount: 1 },
-    { name: "responseType", maxCount: 1 },
-  ]),
-  async (req, res) => {
-    try {
-      console.log("📩 Incoming /analyze request");
-      console.log("Headers:", req.headers["content-type"]);
-      console.log("Body:", req.body);
-      console.log("Files:", req.files);
+// --- Analyze Endpoint (JSON-based) ---
+app.post("/analyze", async (req, res) => {
+  const { bio, responseType, videoUrl } = req.body;
 
-      const bio = req.body.bio;
-      const responseType = req.body.responseType;
-      const videoFile = req.files?.video?.[0];
+  console.log("📩 Incoming /analyze request");
+  console.log("Body:", req.body);
 
-      if (!bio || !responseType) {
-        return res.status(400).json({
-          success: false,
-          error: "Missing required fields: bio or responseType",
-        });
-      }
+  if (!bio || !responseType) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required fields: bio or responseType",
+    });
+  }
 
-      let analysisText = `Detailed ${responseType} analysis based on bio: "${bio}".`;
+  try {
+    let analysisText = `Detailed ${responseType} analysis based on bio: "${bio}".`;
 
-      // Optional video processing
-      if (videoFile) {
+    // Optional: handle video URL
+    if (videoUrl) {
+      analysisText += `\nVideo provided: ${videoUrl}`;
+      try {
         const frameDir = `uploads/frames-${Date.now()}`;
         fs.mkdirSync(frameDir);
-        try {
-          const frames = await extractFrames(videoFile.path, frameDir, 3);
-          analysisText += `\n✅ Processed ${frames.length} video frames for analysis.`;
-          frames.forEach(frame => fs.unlinkSync(frame)); // clean up frames
-        } catch (err) {
-          console.error("⚠️ FFmpeg error:", err);
-          analysisText += "\n⚠️ Video processing failed, skipping frame analysis.";
-        } finally {
-          fs.unlinkSync(videoFile.path); // always clean up uploaded video
-        }
+        const frames = await extractFramesFromUrl(videoUrl, frameDir, 3);
+        analysisText += `\nExtracted ${frames.length} frames for analysis.`;
+        frames.forEach(frame => fs.unlinkSync(frame));
+        fs.rmdirSync(frameDir);
+      } catch (err) {
+        console.error("FFmpeg error:", err);
+        analysisText += "\nCould not process video frames (ffmpeg error).";
       }
-
-      const bioSummary = `Quick summary of player: ${bio}`;
-
-      return res.json({
-        success: true,
-        bioSummary,
-        analysis: analysisText,
-      });
-    } catch (error) {
-      console.error("❌ Analysis error:", error);
-      return res.status(500).json({
-        success: false,
-        error: "Internal server error while processing analysis.",
-      });
     }
+
+    const bioSummary = `Quick summary of player: ${bio}`;
+
+    return res.json({
+      success: true,
+      bioSummary,
+      analysis: analysisText,
+    });
+
+  } catch (error) {
+    console.error("Analysis error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Internal server error while processing analysis.",
+    });
   }
-);
+});
 
 // --- Chatbot Endpoint ---
-app.post("/chatbot", express.json(), async (req, res) => {
+app.post("/chatbot", async (req, res) => {
   const { bio, message } = req.body;
 
   if (!bio || !message) {
@@ -110,7 +97,7 @@ app.post("/chatbot", express.json(), async (req, res) => {
 
 // --- Root Endpoint ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running!");
+  res.send("🎮 Fortnite AI API running with JSON + videoUrl support!");
 });
 
 // --- Start Server ---
