@@ -4,39 +4,35 @@ import multer from "multer";
 import fs from "fs";
 import { exec } from "child_process";
 import OpenAI from "openai";
-import path from "path";
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- OpenAI setup ---
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// --- Helper: Extract frames from uploaded video ---
+// --- Helper: Extract frames from video ---
 function extractFrames(videoPath, outputDir, count = 3) {
   return new Promise((resolve, reject) => {
-    fs.mkdirSync(outputDir, { recursive: true });
-    const cmd = `ffmpeg -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
+    const cmd = `ffmpeg -i ${videoPath} -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
       const frames = fs
         .readdirSync(outputDir)
-        .filter(f => f.startsWith("frame-") && f.endsWith(".png"))
-        .map(f => path.join(outputDir, f));
+        .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
+        .map((f) => `${outputDir}/${f}`);
       resolve(frames);
     });
   });
 }
 
-// --- Helper: Create textual summary of frames ---
+// --- Helper: Summarize frames ---
 function summarizeFrames(frames) {
-  return `The player performs aggressive plays, builds frequently, rotates actively, and engages in mid-range fights. ${frames.length} frames were analyzed.`;
+  return `Extracted ${frames.length} frames from the gameplay video for analysis.`;
 }
 
-// --- Analyze Endpoint ---
+// --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
   const { bio, focus, responseType } = req.body;
   const videoFile = req.file;
@@ -53,131 +49,117 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
     if (videoFile) {
       const frameDir = `uploads/frames-${Date.now()}`;
+      fs.mkdirSync(frameDir);
       const frames = await extractFrames(videoFile.path, frameDir, 3);
       frameSummary = summarizeFrames(frames);
 
-      // Cleanup frames
-      frames.forEach(f => fs.unlinkSync(f));
+      frames.forEach((f) => fs.unlinkSync(f));
       fs.rmdirSync(frameDir);
-
-      // Cleanup video
       fs.unlinkSync(videoFile.path);
     }
   } catch (err) {
     console.error("Frame extraction error:", err);
-    frameSummary = "Video processing failed, no frames analyzed.";
+    frameSummary = "Video processing failed or no frames extracted.";
   }
 
   try {
-    // Focus instructions
+    // --- Focus type handling ---
     let focusPrompt = "";
     switch (focus.toLowerCase()) {
-      case "gameplay":
-        focusPrompt = "Provide overall gameplay analysis including aim, positioning, building, and edits.";
-        break;
       case "aim":
         focusPrompt = "Focus mainly on aiming and shooting accuracy.";
         break;
       case "building":
-        focusPrompt = "Focus mainly on building and editing skills.";
+        focusPrompt = "Focus mainly on building, edits, and structural plays.";
         break;
       case "positioning":
-        focusPrompt = "Focus mainly on positioning, rotations, and map awareness.";
+        focusPrompt = "Focus mainly on positioning, rotations, and awareness.";
         break;
       case "all":
-        focusPrompt = "Analyze everything: aim, positioning, building, edits, rotations, and overall gameplay.";
+      case "gameplay":
+        focusPrompt =
+          "Analyze everything: aim, positioning, building, edits, and overall gameplay.";
         break;
       default:
         focusPrompt = "Provide general gameplay analysis.";
     }
 
-    // ResponseType instructions
+    // --- Response type handling ---
     let responsePrompt = "";
     switch (responseType.toLowerCase()) {
       case "stats":
-        responsePrompt = "Provide numeric ratings out of 10 for relevant skills.";
+        responsePrompt = "Provide numeric ratings (out of 10) for each area.";
         break;
       case "improvement":
-        responsePrompt = "Provide actionable improvement tips.";
+        responsePrompt = "Give detailed improvement advice.";
         break;
       case "coach":
-        responsePrompt = "Provide detailed coaching feedback and advice.";
+        responsePrompt = "Respond like a professional Fortnite coach.";
         break;
       case "summary":
-        responsePrompt = "Provide a short descriptive summary of the player's performance.";
+        responsePrompt = "Provide a concise gameplay summary.";
         break;
       default:
-        responsePrompt = "Provide detailed feedback.";
+        responsePrompt = "Provide general gameplay feedback.";
     }
 
-    const analysisPrompt = `You are a professional Fortnite gameplay coach.
-Analyze the following player:
+    // --- Full prompt for AI ---
+    const analysisPrompt = `
+You are a professional Fortnite gameplay analyst.
+
+Analyze this player based on the following:
 Bio: ${bio}
-Video summary: ${frameSummary}
-
+Video Summary: ${frameSummary}
 Focus: ${focusPrompt}
-Output type: ${responsePrompt}
+Response Type: ${responsePrompt}
 
-Return the result in JSON format ONLY containing the analysis data.`;
+Rules:
+- Respond ONLY in plain text (no JSON, no lists, no *, no quotes, no brackets).
+- Do NOT use markdown formatting like \`\`\` or **.
+- Write naturally like you're talking to the player.
+    `;
 
-    // Call OpenAI
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a professional Fortnite gameplay analyst." },
-        { role: "user", content: analysisPrompt }
-      ]
+        {
+          role: "system",
+          content:
+            "You are a Fortnite gameplay coach. Always reply in clean human-readable text. Never use *, {}, or ```.",
+        },
+        { role: "user", content: analysisPrompt },
+      ],
     });
 
-    const aiText = aiResponse.choices[0].message.content;
+    // --- Cleanup output ---
+    let cleanText = aiResponse.choices[0].message.content.trim();
 
-    // Parse JSON from AI
-    let analysisJSON;
-    try {
-      analysisJSON = JSON.parse(aiText);
-    } catch (err) {
-      console.error("Error parsing AI response:", err);
-      // Wrap plain text in analysis object
-      analysisJSON = { feedback: aiText };
-    }
+    cleanText = cleanText
+      .replace(/```[\s\S]*?```/g, "") // remove code blocks
+      .replace(/[{}[\]"*]/g, "") // remove brackets, stars, quotes
+      .replace(/feedback:/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
 
-    // ✅ Return ONLY the analysis object
     return res.json({
       success: true,
-      analysis: analysisJSON
+      analysis: cleanText,
     });
-
-  } catch (err) {
-    console.error("Analysis error:", err);
+  } catch (error) {
+    console.error("AI Analysis error:", error);
     return res.status(500).json({
       success: false,
-      error: "Internal server error while processing analysis"
+      error: "Internal server error during analysis.",
     });
   }
 });
 
-// --- Chatbot Endpoint ---
-app.post("/chatbot", async (req, res) => {
-  const { bio, message } = req.body;
-  if (!bio || !message) {
-    return res.status(400).json({ success: false, error: "Missing bio or message" });
-  }
-
-  try {
-    const reply = `Chatbot reply considering bio: "${bio}" and message: "${message}".`;
-    return res.json({ success: true, reply });
-  } catch (err) {
-    console.error("Chatbot error:", err);
-    return res.status(500).json({ success: false, error: "Internal server error" });
-  }
-});
-
-// --- Root Endpoint ---
+// --- Root route ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running with clean analysis output!");
+  res.send("🎮 Fortnite AI API running!");
 });
 
-// --- Start Server ---
+// --- Start server ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`✅ Server running on port ${port}`);
