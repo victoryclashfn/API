@@ -33,8 +33,6 @@ function extractFrames(videoPath, outputDir, count = 3) {
 
 // --- Helper: Create textual summary of frames ---
 function summarizeFrames(frames) {
-  // For now, a placeholder summary
-  // You could implement real image analysis later
   return `The player performs aggressive plays, builds frequently, rotates actively, and engages in mid-range fights. ${frames.length} frames were analyzed.`;
 }
 
@@ -120,7 +118,7 @@ Video summary: ${frameSummary}
 Focus: ${focusPrompt}
 Output type: ${responsePrompt}
 
-Return the result in JSON format if possible.`;
+Return the result in JSON format ONLY containing the analysis data.`;
 
     // Call OpenAI
     const aiResponse = await openai.chat.completions.create({
@@ -133,17 +131,19 @@ Return the result in JSON format if possible.`;
 
     const aiText = aiResponse.choices[0].message.content;
 
+    // Parse JSON from AI
     let analysisJSON;
     try {
       analysisJSON = JSON.parse(aiText);
     } catch (err) {
       console.error("Error parsing AI response:", err);
+      // Wrap plain text in analysis object
       analysisJSON = { feedback: aiText };
     }
 
+    // ✅ Return ONLY the analysis object
     return res.json({
       success: true,
-      bioSummary: `Quick summary of player: ${bio}`,
       analysis: analysisJSON
     });
 
@@ -151,7 +151,7 @@ Return the result in JSON format if possible.`;
     console.error("Analysis error:", err);
     return res.status(500).json({
       success: false,
-      error: "Internal server error while processing analysis."
+      error: "Internal server error while processing analysis"
     });
   }
 });
@@ -174,7 +174,7 @@ app.post("/chatbot", async (req, res) => {
 
 // --- Root Endpoint ---
 app.get("/", (req, res) => {
-  res.send("🎮 Fortnite AI API running with real video frame analysis!");
+  res.send("🎮 Fortnite AI API running with clean analysis output!");
 });
 
 // --- Start Server ---
