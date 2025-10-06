@@ -53,6 +53,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       const frames = await extractFrames(videoFile.path, frameDir, 3);
       frameSummary = summarizeFrames(frames);
 
+      // Delete frames & uploaded video
       frames.forEach((f) => fs.unlinkSync(f));
       fs.rmdirSync(frameDir);
       fs.unlinkSync(videoFile.path);
@@ -88,13 +89,12 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     switch (responseType.toLowerCase()) {
       case "stats":
         responsePrompt = `
-Respond with numeric scores (out of 10) and short feedback lines.
+Respond with numeric scores (out of 10) only.
 Example:
 Aiming: 8/10
 Building: 7/10
 Positioning: 6/10
-Overall: 7/10
-Quick Feedback: Short advice on improvement.`;
+Overall: 7/10`;
         break;
       case "improvement":
         responsePrompt = `
