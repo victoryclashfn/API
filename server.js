@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Helpers
+// --- Helpers ---
 function extractFrames(videoPath, outputDir, count = 5) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
@@ -72,10 +72,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     const videoFile = req.file;
 
     if (!game || !responseType || !focusArea || !detailLevel || !videoFile) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields."
-      });
+      return res.status(400).json({ success: false, error: "Missing required fields." });
     }
 
     let frameSummary = "No frames extracted.";
@@ -105,7 +102,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       frameSummary = "Video processing failed or no frames extracted.";
     }
 
-    // Build prompts
+    // --- Build Prompts ---
     const focusPromptMap = {
       aim: "Focus on aiming, shooting accuracy, and tracking.",
       building: "Focus on building speed, edits, and structure control.",
@@ -124,7 +121,7 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
     const detailMultiplier = detailMultiplierMap[detailLevel.toLowerCase()] || 1;
 
-    // Plain text analysis
+    // --- Plain Text Analysis ---
     const analysisPrompt = `
 You are a professional ${game} gameplay analyst.
 Player Bio: ${bio || "No bio provided"}
@@ -148,44 +145,20 @@ Provide a clean, readable, plain text analysis. Add spacing between sections. Ne
     cleanText = cleanText.replace(/[{}[\]*#"]/g, "").replace(/\n{3,}/g, "\n\n").trim();
     cleanText = applyDynamicSpacing(cleanText);
 
-    // Structured JSON for charts
-    const jsonPrompt = `
-You are a gameplay analysis assistant. Based on the video summary and analysis, return ONLY a JSON object:
-{
-  "headline": string,
-  "analysis": string,
-  "stats": { "accuracy": int, "positioning": int, "editing": int, "building": int },
-  "accuracyTimeline": [int,...]
-}
-Use realistic values consistent with the analysis.
-`;
+    // --- Structured JSON for Charts ---
+    const baseStats = { accuracy: 80, positioning: 75, editing: 70, building: 65 };
+    const generateTimeline = (base) => Array.from({ length: frameCount }, (_, i) => Math.min(100, Math.max(0, base + Math.round(Math.random()*10-5))));
 
-    let chartData = null;
-    try {
-      const aiJsonResp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "Return strictly valid JSON only." },
-          { role: "user", content: jsonPrompt }
-        ],
-        temperature: 0.2,
-        max_tokens: 500
+    let charts = [];
+    const focusTypes = focusArea.toLowerCase() === "overall" ? ["accuracy","positioning","editing","building"] : [focusArea.toLowerCase()];
+
+    focusTypes.forEach((type) => {
+      charts.push({
+        label: type.charAt(0).toUpperCase() + type.slice(1),
+        labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i+1}`),
+        data: generateTimeline(baseStats[type] || 70)
       });
-
-      const jsonText = aiJsonResp.choices?.[0]?.message?.content || "";
-      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
-      chartData = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(jsonText);
-
-      if (!chartData.stats || !Array.isArray(chartData.accuracyTimeline)) chartData = null;
-    } catch (err) {
-      console.warn("Structured JSON parse failed, using fallback:", err);
-    }
-
-    if (!chartData) {
-      const base = { accuracy: 80, positioning: 75, editing: 70, building: 65 };
-      const timeline = Array.from({ length: frameCount }, (_, i) => Math.min(100, Math.max(0, base.accuracy + Math.round(Math.random()*10-5))));
-      chartData = { headline: "Summary & Stats", analysis: cleanText, stats: base, accuracyTimeline: timeline };
-    }
+    });
 
     return res.json({
       success: true,
@@ -193,9 +166,9 @@ Use realistic values consistent with the analysis.
       keyMoments,
       videoLength: Math.round(videoLength),
       frameCount,
-      stats: chartData.stats,
-      accuracyTimeline: chartData.accuracyTimeline,
-      headline: chartData.headline
+      stats: baseStats,
+      charts,
+      headline: "Gameplay Analysis"
     });
 
   } catch (error) {
@@ -205,7 +178,7 @@ Use realistic values consistent with the analysis.
 });
 
 // Root
-app.get("/", (req, res) => res.send("🎮 GPT-4o Game AI API with chart data!"));
+app.get("/", (req, res) => res.send("🎮 GPT-4o Game AI API with multi-chart carousel support!"));
 
 // Start server
 const port = process.env.PORT || 3000;
