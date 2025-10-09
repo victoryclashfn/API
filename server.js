@@ -5,6 +5,7 @@ import multer from "multer";
 import fs from "fs";
 import { exec } from "child_process";
 import OpenAI from "openai";
+import path from "path";
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -18,21 +19,25 @@ app.use(express.urlencoded({ extended: true }));
 // --- Helper: Extract frames from video ---
 function extractFrames(videoPath, outputDir, count = 5) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
+    const cmd = `ffmpeg -y -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
-      const frames = fs
-        .readdirSync(outputDir)
-        .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
-        .map((f) => `${outputDir}/${f}`);
-      resolve(frames);
+      try {
+        const frames = fs
+          .readdirSync(outputDir)
+          .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
+          .map((f) => path.join(outputDir, f));
+        resolve(frames);
+      } catch (e) {
+        reject(e);
+      }
     });
   });
 }
 
 // --- Helper: Detect key moments using FFmpeg scene detection ---
 function detectKeyMomentsFFmpeg(videoPath) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
     exec(cmd, (err, stdout, stderr) => {
       if (err) return resolve("No key moments detected");
@@ -44,7 +49,7 @@ function detectKeyMomentsFFmpeg(videoPath) {
   });
 }
 
-// --- Helper: Apply strict dynamic spacing ---
+// --- Helper: Apply dynamic spacing ---
 function applyDynamicSpacing(text) {
   let spaced = text.replace(/\n\s*\n/g, "\n\n");
   spaced = spaced.replace(/([^\n])\n([^\n])/g, "$1\n\n$2");
@@ -52,7 +57,7 @@ function applyDynamicSpacing(text) {
   return spaced.trim();
 }
 
-// --- Helper: Get video duration in seconds ---
+// --- Helper: Get video duration ---
 function getVideoDuration(videoPath) {
   return new Promise((resolve, reject) => {
     const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
@@ -65,74 +70,61 @@ function getVideoDuration(videoPath) {
 
 // --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
-  const { game, responseType, focusArea, detailLevel, bio } = req.body;
-  const videoFile = req.file;
-
-  if (!game || !responseType || !focusArea || !detailLevel || !bio) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing required fields: game, responseType, focusArea, detailLevel, or bio",
-    });
-  }
-
-  let frameSummary = "";
-  let keyMoments = "";
-  let videoLength = 0;
-
   try {
-    if (videoFile) {
+    const { game, responseType, focusArea, detailLevel, bio } = req.body;
+    const videoFile = req.file;
+
+    if (!game || !responseType || !focusArea || !detailLevel || !bio || !videoFile) {
+      return res.status(400).json({ success: false, error: "Missing required fields or video." });
+    }
+
+    let frameSummary = "No frames extracted.";
+    let keyMoments = "No key moments detected.";
+    let videoLength = 0;
+    let frameCount = 5;
+
+    try {
       videoLength = await getVideoDuration(videoFile.path);
 
-      // Determine dynamic frame count
-      let frameCount = 5;
       if (videoLength >= 30 && videoLength <= 120) frameCount = 10;
       else if (videoLength > 120) frameCount = 15;
 
-      const frameDir = `uploads/frames-${Date.now()}`;
-      fs.mkdirSync(frameDir);
+      const frameDir = path.join("uploads", `frames-${Date.now()}`);
+      fs.mkdirSync(frameDir, { recursive: true });
 
       const frames = await extractFrames(videoFile.path, frameDir, frameCount);
       frameSummary = `Extracted ${frames.length} frames from the ${Math.round(videoLength)}s gameplay video.`;
 
       keyMoments = await detectKeyMomentsFFmpeg(videoFile.path);
 
-      // Clean up frames & video
+      // Cleanup frames & video
       frames.forEach((f) => fs.unlinkSync(f));
       fs.rmdirSync(frameDir);
       fs.unlinkSync(videoFile.path);
-    }
-  } catch (err) {
-    console.error("Video processing error:", err);
-    frameSummary = "Video processing failed or no frames extracted.";
-    keyMoments = "No key moments detected.";
-  }
 
-  try {
+    } catch (err) {
+      console.error("Video processing error:", err);
+      frameSummary = "Video processing failed or no frames extracted.";
+    }
+
     // --- Focus Prompt ---
-    let focusPrompt = "";
-    switch (focusArea.toLowerCase()) {
-      case "aim": focusPrompt = "Focus on aiming, shooting accuracy, and tracking."; break;
-      case "building": focusPrompt = "Focus on building speed, edits, and structure control."; break;
-      case "positioning": focusPrompt = "Focus on positioning, rotations, and awareness."; break;
-      case "overall": focusPrompt = "Analyze everything comprehensively."; break;
-      default: focusPrompt = "Provide general gameplay analysis."; 
-    }
+    let focusPrompt = {
+      aim: "Focus on aiming, shooting accuracy, and tracking.",
+      building: "Focus on building speed, edits, and structure control.",
+      positioning: "Focus on positioning, rotations, and awareness.",
+      overall: "Analyze everything comprehensively."
+    }[focusArea.toLowerCase()] || "Provide general gameplay analysis.";
 
-    // --- Response Type Prompt ---
-    let responsePrompt = "";
-    switch (responseType.toLowerCase()) {
-      case "short": responsePrompt = "Provide a short 2–3 sentence summary."; break;
-      case "balanced": responsePrompt = "Provide a balanced analysis with brief scores and suggestions."; break;
-      case "detailed": responsePrompt = "Provide detailed step-by-step advice with examples."; break;
-      case "coach": responsePrompt = "Respond like a professional coach with tips and encouragement."; break;
-      default: responsePrompt = "Provide general feedback."; 
-    }
+    // --- Response Prompt ---
+    let responsePrompt = {
+      short: "Provide a short 2–3 sentence summary.",
+      balanced: "Provide a balanced analysis with brief scores and suggestions.",
+      detailed: "Provide detailed step-by-step advice with examples.",
+      coach: "Respond like a professional coach with tips and encouragement."
+    }[responseType.toLowerCase()] || "Provide general feedback.";
 
     // --- Detail Multiplier ---
-    let detailMultiplier = 1;
-    if (detailLevel.toLowerCase() === "low") detailMultiplier = 0.8;
-    else if (detailLevel.toLowerCase() === "normal") detailMultiplier = 1;
-    else if (detailLevel.toLowerCase() === "high") detailMultiplier = 3;
+    let detailMultiplier = { low: 0.8, normal: 1, high: 3 }[detailLevel.toLowerCase()] || 1;
 
     // --- AI Prompt ---
     const analysisPrompt = `
@@ -166,15 +158,12 @@ Provide a clean, readable, plain text analysis. Add extra spacing between sectio
       analysis: cleanText,
       keyMoments,
       videoLength: Math.round(videoLength),
-      frameCount: frameCount,
+      frameCount,
     });
 
   } catch (error) {
-    console.error("AI Analysis error:", error);
-    return res.status(500).json({
-      success: false,
-      error: "Internal server error during analysis.",
-    });
+    console.error("Analysis endpoint error:", error);
+    return res.status(500).json({ success: false, error: error.message || "Internal server error." });
   }
 });
 
