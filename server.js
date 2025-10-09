@@ -4,7 +4,6 @@ import multer from "multer";
 import fs from "fs";
 import { exec } from "child_process";
 import OpenAI from "openai";
-import cv from "opencv4nodejs"; // npm install opencv4nodejs
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -16,7 +15,7 @@ app.use(express.urlencoded({ extended: true }));
 // --- Helper: Extract frames from video ---
 function extractFrames(videoPath, outputDir, count = 5) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -i ${videoPath} -vf "thumbnail,scale=640:360" -frames:v ${count} ${outputDir}/frame-%02d.png -hide_banner -loglevel error`;
+    const cmd = `ffmpeg -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
       const frames = fs
@@ -28,19 +27,18 @@ function extractFrames(videoPath, outputDir, count = 5) {
   });
 }
 
-// --- Helper: Analyze key moments using OpenCV ---
-async function detectKeyMoments(frames) {
-  const keyMoments = [];
-  for (let i = 0; i < frames.length; i++) {
-    const img = cv.imread(frames[i]);
-    const gray = img.bgrToGray();
-    const edges = gray.canny(50, 150);
-    const nonZero = edges.countNonZero();
-
-    // Heuristic: high activity frames may indicate kills/explosions
-    if (nonZero > 5000) keyMoments.push(`Frame ${i + 1}`);
-  }
-  return keyMoments.length > 0 ? keyMoments.join(", ") : "No key moments detected";
+// --- Helper: Detect key moments using FFmpeg scene detection ---
+function detectKeyMomentsFFmpeg(videoPath) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) return resolve("No key moments detected");
+      const matches = stderr.match(/pts_time:(\d+\.?\d*)/g) || [];
+      const times = matches.map((m) => m.replace("pts_time:", ""));
+      if (times.length === 0) return resolve("No key moments detected");
+      resolve(times.slice(0, 10).map((t) => `${Math.round(t)}s`).join(", "));
+    });
+  });
 }
 
 // --- Helper: Apply strict dynamic spacing ---
@@ -49,6 +47,18 @@ function applyDynamicSpacing(text) {
   spaced = spaced.replace(/([^\n])\n([^\n])/g, "$1\n\n$2");
   spaced = spaced.replace(/\n{3,}/g, "\n\n");
   return spaced.trim();
+}
+
+// --- Helper: Get video duration in seconds ---
+function getVideoDuration(videoPath) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
+    exec(cmd, (err, stdout) => {
+      if (err) return reject(err);
+      const duration = parseFloat(stdout.trim());
+      resolve(duration);
+    });
+  });
 }
 
 // --- /analyze endpoint ---
@@ -65,15 +75,24 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
 
   let frameSummary = "";
   let keyMoments = "";
+  let videoLength = 0;
 
   try {
     if (videoFile) {
+      videoLength = await getVideoDuration(videoFile.path);
+
+      // Determine dynamic frame count
+      let frameCount = 5;
+      if (videoLength >= 30 && videoLength <= 120) frameCount = 10;
+      else if (videoLength > 120) frameCount = 15;
+
       const frameDir = `uploads/frames-${Date.now()}`;
       fs.mkdirSync(frameDir);
-      const frames = await extractFrames(videoFile.path, frameDir, 5);
-      frameSummary = `Extracted ${frames.length} frames from the gameplay video.`;
 
-      keyMoments = await detectKeyMoments(frames);
+      const frames = await extractFrames(videoFile.path, frameDir, frameCount);
+      frameSummary = `Extracted ${frames.length} frames from the ${Math.round(videoLength)}s gameplay video.`;
+
+      keyMoments = await detectKeyMomentsFFmpeg(videoFile.path);
 
       // Clean up frames & video
       frames.forEach((f) => fs.unlinkSync(f));
@@ -131,10 +150,7 @@ Provide a clean, readable, plain text analysis. Add extra spacing between sectio
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: `You are a professional ${game} coach. Return plain formatted text only.`,
-        },
+        { role: "system", content: `You are a professional ${game} coach. Return plain formatted text only.` },
         { role: "user", content: analysisPrompt },
       ],
     });
@@ -147,6 +163,8 @@ Provide a clean, readable, plain text analysis. Add extra spacing between sectio
       success: true,
       analysis: cleanText,
       keyMoments,
+      videoLength: Math.round(videoLength),
+      frameCount: frameCount,
     });
 
   } catch (error) {
@@ -160,7 +178,7 @@ Provide a clean, readable, plain text analysis. Add extra spacing between sectio
 
 // --- Root Route ---
 app.get("/", (req, res) => {
-  res.send("🎮 GPT-4o Game AI API running with key moment detection!");
+  res.send("🎮 GPT-4o Game AI API running with dynamic frame count and FFmpeg key moment detection!");
 });
 
 // --- Start Server ---
