@@ -1,5 +1,6 @@
 // server.js
 import express from "express";
+import cors from "cors";
 import multer from "multer";
 import fs from "fs";
 import { exec } from "child_process";
@@ -9,6 +10,8 @@ const app = express();
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// --- Enable CORS for frontend ---
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -55,8 +58,7 @@ function getVideoDuration(videoPath) {
     const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
     exec(cmd, (err, stdout) => {
       if (err) return reject(err);
-      const duration = parseFloat(stdout.trim());
-      resolve(duration);
+      resolve(parseFloat(stdout.trim()));
     });
   });
 }
