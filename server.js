@@ -65,6 +65,38 @@ function getVideoDuration(videoPath) {
   });
 }
 
+function calculateCost({ videoLength, detailLevel, responseType }) {
+  const basePerSecond = 0.02; // $0.02 per second
+  const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
+  const responseMultiplierMap = { short: 0.8, balanced: 1, detailed: 1.5, coach: 2 };
+
+  const detailMultiplier = detailMultiplierMap[detailLevel?.toLowerCase()] || 1;
+  const responseMultiplier = responseMultiplierMap[responseType?.toLowerCase()] || 1;
+
+  return +(videoLength * basePerSecond * detailMultiplier * responseMultiplier).toFixed(2);
+}
+
+// --- /calculate-cost endpoint ---
+app.post("/calculate-cost", upload.single("video"), async (req, res) => {
+  try {
+    const { detailLevel, responseType } = req.body;
+    const videoFile = req.file;
+
+    if (!videoFile) return res.status(400).json({ success: false, error: "No video uploaded" });
+
+    const videoLength = await getVideoDuration(videoFile.path);
+    const cost = calculateCost({ videoLength, detailLevel, responseType });
+
+    // Cleanup uploaded video
+    try { fs.unlinkSync(videoFile.path); } catch (e) {}
+
+    return res.json({ success: true, videoLength: Math.round(videoLength), cost });
+  } catch (error) {
+    console.error("Cost calculation error:", error);
+    return res.status(500).json({ success: false, error: "Error calculating cost" });
+  }
+});
+
 // --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
@@ -102,17 +134,6 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       frameSummary = "Video processing failed or no frames extracted.";
     }
 
-    // --- Cost Calculation ---
-    const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
-    const responseMultiplierMap = { short: 1, balanced: 1.2, detailed: 1.5, coach: 1.7 };
-
-    const detailMultiplier = detailMultiplierMap[detailLevel.toLowerCase()] || 1;
-    const responseMultiplier = responseMultiplierMap[responseType.toLowerCase()] || 1;
-
-    // Base cost: 20 credits per second of video
-    const baseCost = videoLength * 20;
-    const totalCost = Math.ceil(baseCost * detailMultiplier * responseMultiplier);
-
     // --- Build Prompts ---
     const focusPromptMap = {
       aim: "Focus on aiming, shooting accuracy, and tracking.",
@@ -129,6 +150,8 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
     };
     const focusPrompt = focusPromptMap[focusArea.toLowerCase()] || "Provide general gameplay analysis.";
     const responsePrompt = responsePromptMap[responseType.toLowerCase()] || "Provide general feedback.";
+    const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
+    const detailMultiplier = detailMultiplierMap[detailLevel.toLowerCase()] || 1;
 
     // --- Plain Text Analysis ---
     const analysisPrompt = `
@@ -177,8 +200,7 @@ Provide a clean, readable, plain text analysis. Add spacing between sections. Ne
       frameCount,
       stats: baseStats,
       charts,
-      headline: "Gameplay Analysis",
-      cost: totalCost // <-- Added cost here
+      headline: "Gameplay Analysis"
     });
 
   } catch (error) {
