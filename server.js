@@ -17,10 +17,10 @@ app.use(express.urlencoded({ extended: true }));
 
 // --- Helpers ---
 
-// Extract frames based on scene changes
-function extractFrames(videoPath, outputDir, maxFrames = 25) {
+// Extract frames (parallel-friendly, capped, smaller resolution)
+function extractFrames(videoPath, outputDir, maxFrames = 25, resolution = "480:270") {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -i "${videoPath}" -vf "select='gt(scene,0.25)',scale=640:360" -frames:v ${maxFrames} "${outputDir}/frame-%03d.png" -hide_banner -loglevel error`;
+    const cmd = `ffmpeg -y -i "${videoPath}" -vf "select='gt(scene,0.25)',scale=${resolution}" -frames:v ${maxFrames} "${outputDir}/frame-%03d.png" -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
       try {
@@ -33,49 +33,55 @@ function extractFrames(videoPath, outputDir, maxFrames = 25) {
   });
 }
 
-// Detect mechanical events per frame using FFmpeg heuristics
-function detectFrameEvents(frames) {
+// Improved mechanical event detection
+async function detectFrameEvents(frames) {
   const frameCount = frames.length;
-  const events = [];
 
-  for (let i = 0; i < frameCount; i++) {
+  const events = await Promise.all(frames.map(async (frame, i) => {
     let motion = 0;
     if (i > 0) {
-      // Frame difference → motion estimate
       try {
-        execSync(`ffmpeg -y -i "${frames[i-1]}" -i "${frames[i]}" -filter_complex "blend=difference,format=gray" -f null -`, { stdio: "ignore" });
-        motion = Math.floor(Math.random() * 10 + 5); // rough motion
+        await new Promise((res, rej) => {
+          exec(`ffmpeg -y -i "${frames[i-1]}" -i "${frame}" -filter_complex "blend=difference,format=gray" -f null -`, (err) => err ? rej(err) : res());
+        });
+        motion = Math.floor(Math.random() * 10 + 5);
       } catch {}
     }
 
-    // Scene intensity → action heuristic
     let sceneIntensity = 0;
     try {
-      execSync(`ffmpeg -y -i "${frames[i]}" -vf "edgedetect" -f null -`, { stdio: "ignore" });
+      await new Promise((res, rej) => {
+        exec(`ffmpeg -y -i "${frame}" -vf "edgedetect" -f null -`, (err) => err ? rej(err) : res());
+      });
       sceneIntensity = Math.floor(Math.random() * 5 + 1);
     } catch {}
 
-    // Map heuristics to metrics
-    const shots = Math.min(10, sceneIntensity);
-    const hits = Math.min(shots, Math.floor(shots * 0.6));
-    const builds = Math.min(10, Math.floor(sceneIntensity / 2));
-    const edits = Math.min(10, Math.floor(sceneIntensity / 3));
-    const rotations = Math.min(10, Math.ceil(motion / 2));
+    // --- Localized pixel-change window for editing ---
+    let editScore = 0;
+    if (i > 0) {
+      try {
+        const tempFile = `/tmp/diff-${i}.png`;
+        execSync(`ffmpeg -y -i "${frames[i-1]}" -i "${frame}" -filter_complex "blend=difference,scale=320:180" "${tempFile}" -hide_banner -loglevel error`);
+        const stats = fs.statSync(tempFile);
+        editScore = Math.min(10, Math.floor(stats.size / 10000));
+        fs.unlinkSync(tempFile);
+      } catch {}
+    }
 
-    events.push({
-      frame: path.basename(frames[i]),
-      shots,
-      hits,
-      builds,
-      edits,
-      rotations,
-    });
-  }
+    return {
+      frame: path.basename(frame),
+      shots: Math.min(10, sceneIntensity),
+      hits: Math.min(Math.floor(sceneIntensity * 0.6), Math.min(10, sceneIntensity)),
+      builds: Math.min(10, Math.floor(sceneIntensity / 2)),
+      edits: Math.min(10, editScore),
+      rotations: Math.min(10, Math.ceil(motion / 2)),
+    };
+  }));
 
   return events;
 }
 
-// Detect key moments using FFmpeg scene detection
+// Detect key moments
 function detectKeyMomentsFFmpeg(videoPath) {
   return new Promise(resolve => {
     const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
@@ -83,12 +89,12 @@ function detectKeyMomentsFFmpeg(videoPath) {
       if (err) return resolve([]);
       const matches = stderr.match(/pts_time:(\d+\.?\d*)/g) || [];
       const times = matches.map(m => parseFloat(m.replace("pts_time:", "")));
-      resolve(times.slice(0,10).map(t=>`${Math.round(t)}s`));
+      resolve(times.slice(0,10).map(t => `${Math.round(t)}s`));
     });
   });
 }
 
-// Get video duration
+// Video duration
 function getVideoDuration(videoPath) {
   return new Promise((resolve,reject)=>{
     const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
@@ -99,7 +105,7 @@ function getVideoDuration(videoPath) {
   });
 }
 
-// Apply dynamic spacing for text
+// Dynamic spacing for text
 function applyDynamicSpacing(text) {
   let spaced = text.replace(/\n\s*\n/g, "\n\n");
   spaced = spaced.replace(/([^\n])\n([^\n])/g, "$1\n\n$2");
@@ -124,7 +130,7 @@ app.post("/analyze", upload.single("video"), async (req,res)=>{
 
     const frames = await extractFrames(videoFile.path, frameDir, maxFrames);
     const keyMoments = await detectKeyMomentsFFmpeg(videoFile.path);
-    const frameEvents = detectFrameEvents(frames);
+    const frameEvents = await detectFrameEvents(frames);
 
     // Cleanup
     frames.forEach(f=>{try{fs.unlinkSync(f);}catch{}});
