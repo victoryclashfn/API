@@ -63,85 +63,65 @@ function applyDynamicSpacing(text) {
   return spaced.trim();
 }
 
-function getVideoDuration(videoPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
-    exec(cmd, (err, stdout) => {
-      if (err) return reject(err);
-      resolve(parseFloat(stdout.trim()));
-    });
-  });
-}
-
 // --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
-    const { game, responseType, focusArea, detailLevel, bio } = req.body;
+    const {
+      game, responseType, focusArea, detailLevel, bio,
+      focusAreas, skillLevel, feedbackStyle, clipType, language, audioInClip, advancedOptions
+    } = req.body;
+
     const videoFile = req.file;
 
     if (!game || !responseType || !focusArea || !detailLevel || !videoFile) {
       return res.status(400).json({ success: false, error: "Missing required fields." });
     }
 
+    // Parse JSON fields
+    const parsedFocusAreas = focusAreas ? JSON.parse(focusAreas) : [focusArea];
+    const parsedAdvancedOptions = advancedOptions ? JSON.parse(advancedOptions) : {};
+
     // --- Step 0: Check cache ---
     const videoHash = hashFile(videoFile.path);
     if (analysisCache.has(videoHash)) {
-      // Return cached result
       try { fs.unlinkSync(videoFile.path); } catch(e){}
       return res.json({ ...analysisCache.get(videoHash), cached: true });
     }
 
     // --- Step 1: Detect key moments ---
     const keyTimes = await detectKeyMomentsFFmpeg(videoFile.path);
-    const keyMoments = keyTimes.length ? keyTimes.map(t => `${Math.round(t)}s`) : [];
+    const keyMoments = keyTimes.length ? keyTimes.slice(0, 10).map(t => `${Math.round(t)}s`) : [];
 
-    // --- Step 2: Extract frames around key moments (max 10) ---
+    // --- Step 2: Extract frames ---
     const frameDir = path.join("uploads", `frames-${Date.now()}`);
     fs.mkdirSync(frameDir, { recursive: true });
     let frames = [];
-    try {
-      const frameCount = Math.min(keyMoments.length || 5, 10);
-      frames = await extractFrames(videoFile.path, frameDir, frameCount);
-    } catch (err) {
-      console.error("Frame extraction failed:", err);
-    }
+    try { frames = await extractFrames(videoFile.path, frameDir, Math.min(keyMoments.length || 5, 10)); } catch(e){ console.error("Frame extraction failed:", e); }
 
-    // --- Step 3: Cleanup frames and video after processing ---
-    try { frames.forEach(f => fs.unlinkSync(f)); fs.rmdirSync(frameDir); fs.unlinkSync(videoFile.path); } catch(e){}
+    // --- Step 3: Cleanup ---
+    try { frames.forEach(f=>fs.unlinkSync(f)); fs.rmdirSync(frameDir); fs.unlinkSync(videoFile.path); } catch(e){}
 
-    // --- Step 4: Focus & response prompts ---
-    const focusPromptMap = {
-      aim: "Focus on aiming, shooting accuracy, and tracking.",
-      building: "Focus on building speed, edits, and structure control.",
-      positioning: "Focus on positioning, rotations, and awareness.",
-      movement: "Focus on movement and positioning decisions.",
-      overall: "Analyze all aspects: aiming, building, positioning, and movement."
-    };
-    const responsePromptMap = {
-      short: "Provide a short 2–3 sentence summary.",
-      balanced: "Provide a balanced analysis with brief scores and suggestions.",
-      detailed: "Provide detailed step-by-step advice with examples.",
-      coach: "Respond like a professional coach with tips and encouragement."
-    };
-    const focusPrompt = focusPromptMap[focusArea.toLowerCase()] || "Provide general gameplay analysis.";
-    const responsePrompt = responsePromptMap[responseType.toLowerCase()] || "Provide general feedback.";
+    // --- Step 4: Build GPT prompt including all settings ---
+    const analysisPrompt = `
+You are a professional ${game} gameplay analyst.
+Player Bio: ${bio || "No bio provided"}
+Focus Areas: ${parsedFocusAreas.join(", ")}
+Skill Level: ${skillLevel || "N/A"}
+Feedback Style: ${feedbackStyle || "N/A"}
+Clip Type: ${clipType || "N/A"}
+Language: ${language || "English"}
+Audio Included: ${audioInClip || "false"}
+Advanced Options: ${JSON.stringify(parsedAdvancedOptions)}
+Key Moments: ${keyMoments.length ? keyMoments.join(", ") : "No key moments detected"}
+Response Type: ${responseType}
+Detail Level: ${detailLevel}
+Provide a clean, readable analysis with spacing between sections.
+`;
 
-    // --- Step 5: Model selection & max tokens ---
     const model = ["detailed","coach"].includes(responseType.toLowerCase()) ? "gpt-4o-mini" : "gpt-3.5-turbo";
     const maxTokensMap = { short: 300, balanced: 600, detailed: 1200, coach: 1500 };
     const max_tokens = maxTokensMap[responseType.toLowerCase()] || 600;
 
-    // --- Step 6: Build GPT prompt ---
-    const analysisPrompt = `
-You are a professional ${game} gameplay analyst.
-Player Bio: ${["detailed","coach"].includes(responseType.toLowerCase()) ? (bio || "No bio provided") : "N/A"}
-Key Moments: ${keyMoments.length ? keyMoments.join(", ") : "No key moments detected"}
-Focus: ${focusPrompt}
-Response Type: ${responsePrompt}
-Provide a clean, readable, plain text analysis. Add spacing between sections.
-`;
-
-    // --- Step 7: Call OpenAI ---
     const aiResp = await openai.chat.completions.create({
       model,
       messages: [
@@ -151,18 +131,15 @@ Provide a clean, readable, plain text analysis. Add spacing between sections.
       max_tokens
     });
 
-    let cleanText = (aiResp.choices?.[0]?.message?.content || "").trim();
-    cleanText = cleanText.replace(/[{}[\]*#"]/g, "").replace(/\n{3,}/g, "\n\n").trim();
-    cleanText = applyDynamicSpacing(cleanText);
+    let cleanText = applyDynamicSpacing(aiResp.choices?.[0]?.message?.content || "No analysis returned");
 
-    // --- Step 8: Generate charts locally ---
+    // --- Step 5: Generate charts ---
     const baseStats = { accuracy: 80, positioning: 75, editing: 70, building: 65 };
     const frameCount = frames.length || Math.min(keyMoments.length || 5, 10);
     const generateTimeline = (base) => Array.from({ length: frameCount }, (_, i) => Math.min(100, Math.max(0, base + Math.round(Math.random()*10-5))));
 
     let charts = [];
-    const focusTypes = focusArea.toLowerCase() === "overall" ? ["accuracy","positioning","editing","building"] : [focusArea.toLowerCase()];
-
+    const focusTypes = parsedFocusAreas.length ? parsedFocusAreas.map(f => f.toLowerCase()) : ["overall"];
     focusTypes.forEach((type) => {
       charts.push({
         label: type.charAt(0).toUpperCase() + type.slice(1),
@@ -171,7 +148,6 @@ Provide a clean, readable, plain text analysis. Add spacing between sections.
       });
     });
 
-    // --- Step 9: Build response & cache ---
     const responseData = {
       success: true,
       analysis: cleanText,
@@ -182,8 +158,7 @@ Provide a clean, readable, plain text analysis. Add spacing between sections.
       headline: "Gameplay Analysis",
       cached: false
     };
-    analysisCache.set(videoHash, responseData); // Cache result
-
+    analysisCache.set(videoHash, responseData);
     return res.json(responseData);
 
   } catch (error) {
