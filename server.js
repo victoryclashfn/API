@@ -65,38 +65,6 @@ function getVideoDuration(videoPath) {
   });
 }
 
-function calculateCost({ videoLength, detailLevel, responseType }) {
-  const basePerSecond = 20; // $0.02 per second
-  const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
-  const responseMultiplierMap = { short: 0.8, balanced: 1, detailed: 1.5, coach: 2 };
-
-  const detailMultiplier = detailMultiplierMap[detailLevel?.toLowerCase()] || 1;
-  const responseMultiplier = responseMultiplierMap[responseType?.toLowerCase()] || 1;
-
-  return +(videoLength * basePerSecond * detailMultiplier * responseMultiplier).toFixed(2);
-}
-
-// --- /calculate-cost endpoint ---
-app.post("/calculate-cost", upload.single("video"), async (req, res) => {
-  try {
-    const { detailLevel, responseType } = req.body;
-    const videoFile = req.file;
-
-    if (!videoFile) return res.status(400).json({ success: false, error: "No video uploaded" });
-
-    const videoLength = await getVideoDuration(videoFile.path);
-    const cost = calculateCost({ videoLength, detailLevel, responseType });
-
-    // Cleanup uploaded video
-    try { fs.unlinkSync(videoFile.path); } catch (e) {}
-
-    return res.json({ success: true, videoLength: Math.round(videoLength), cost });
-  } catch (error) {
-    console.error("Cost calculation error:", error);
-    return res.status(500).json({ success: false, error: "Error calculating cost" });
-  }
-});
-
 // --- /analyze endpoint ---
 app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
