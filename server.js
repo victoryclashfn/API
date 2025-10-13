@@ -66,7 +66,7 @@ function getVideoDuration(videoPath) {
 }
 
 function calculateCost({ videoLength, detailLevel, responseType }) {
-  const basePerSecond = 0.02; // $0.02 per second
+  const basePerSecond = 0.20; // $0.02 per second
   const detailMultiplierMap = { low: 0.8, normal: 1, high: 3 };
   const responseMultiplierMap = { short: 0.8, balanced: 1, detailed: 1.5, coach: 2 };
 
