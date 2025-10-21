@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -12,18 +11,18 @@ const app = express();
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Enable CORS and JSON parsing
-app.use(cors());
+// ---------- BASIC MIDDLEWARE ----------
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- Simple in-memory cache (replace with DB for production) ---
+// ---------- SIMPLE IN-MEMORY CACHE ----------
 const analysisCache = new Map();
 
-// --- Helpers ---
+// ---------- HELPERS ----------
 function hashFile(filePath) {
-  const data = fs.readFileSync(filePath);
-  return crypto.createHash("sha256").update(data).digest("hex");
+  const buffer = fs.readFileSync(filePath);
+  return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
 function extractFrames(videoPath, outputDir, count = 5) {
@@ -34,7 +33,7 @@ function extractFrames(videoPath, outputDir, count = 5) {
       try {
         const frames = fs
           .readdirSync(outputDir)
-          .filter((f) => f.startsWith("frame-") && f.endsWith(".png"))
+          .filter((f) => f.startsWith("frame-"))
           .map((f) => `${outputDir}/${f}`);
         resolve(frames);
       } catch (e) {
@@ -44,132 +43,183 @@ function extractFrames(videoPath, outputDir, count = 5) {
   });
 }
 
-function detectKeyMomentsFFmpeg(videoPath) {
+function detectKeyMoments(videoPath) {
   return new Promise((resolve) => {
     const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
     exec(cmd, (err, stdout, stderr) => {
       if (err) return resolve([]);
       const matches = stderr.match(/pts_time:(\d+\.?\d*)/g) || [];
       const times = matches.map((m) => parseFloat(m.replace("pts_time:", "")));
-      resolve(times.slice(0, 10)); // Limit to 10 key moments
+      resolve(times.slice(0, 10)); // limit to 10 key moments
     });
   });
 }
 
 function applyDynamicSpacing(text) {
-  let spaced = text.replace(/\n\s*\n/g, "\n\n");
-  spaced = spaced.replace(/([^\n])\n([^\n])/g, "$1\n\n$2");
-  spaced = spaced.replace(/\n{3,}/g, "\n\n");
-  return spaced.trim();
+  return text
+    .replace(/\n\s*\n/g, "\n\n")
+    .replace(/([^\n])\n([^\n])/g, "$1\n\n$2")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
-// --- /analyze endpoint ---
+// ---------- COST-EFFICIENT MODEL SELECTOR ----------
+function chooseModel(responseType, detailLevel) {
+  const type = responseType?.toLowerCase() || "";
+  const detail = detailLevel?.toLowerCase() || "normal";
+
+  // gpt-4o-mini for pro / detailed users, gpt-3.5-turbo otherwise
+  if (["coaching", "detailed", "pro-coaching", "advanced"].includes(type)) {
+    return { model: "gpt-4o-mini", tokens: detail === "high" ? 1500 : 1000 };
+  }
+  return { model: "gpt-3.5-turbo", tokens: detail === "low" ? 400 : 700 };
+}
+
+// ---------- /analyze ENDPOINT ----------
 app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
     const {
-      game, responseType, focusArea, detailLevel, bio,
-      focusAreas, skillLevel, feedbackStyle, clipType, language, audioInClip, advancedOptions
+      game,
+      responseType,
+      focusAreas,
+      detailLevel,
+      skillLevel,
+      feedbackStyle,
+      clipType,
+      language,
+      audioInClip,
+      playerBio,
+      extraNotes,
     } = req.body;
 
-    const videoFile = req.file;
-
-    if (!game || !responseType || !focusArea || !detailLevel || !videoFile) {
-      return res.status(400).json({ success: false, error: "Missing required fields." });
+    if (!game || !responseType || !detailLevel || !req.file) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: game, responseType, detailLevel, video",
+      });
     }
 
-    // Parse JSON fields
-    const parsedFocusAreas = focusAreas ? JSON.parse(focusAreas) : [focusArea];
-    const parsedAdvancedOptions = advancedOptions ? JSON.parse(advancedOptions) : {};
+    const focusList =
+      typeof focusAreas === "string"
+        ? focusAreas.split(",").map((s) => s.trim())
+        : Array.isArray(focusAreas)
+        ? focusAreas
+        : ["overall"];
 
-    // --- Step 0: Check cache ---
-    const videoHash = hashFile(videoFile.path);
+    // ---------- CACHE ----------
+    const videoHash = hashFile(req.file.path);
     if (analysisCache.has(videoHash)) {
-      try { fs.unlinkSync(videoFile.path); } catch(e){}
+      fs.unlinkSync(req.file.path);
       return res.json({ ...analysisCache.get(videoHash), cached: true });
     }
 
-    // --- Step 1: Detect key moments ---
-    const keyTimes = await detectKeyMomentsFFmpeg(videoFile.path);
-    const keyMoments = keyTimes.length ? keyTimes.slice(0, 10).map(t => `${Math.round(t)}s`) : [];
-
-    // --- Step 2: Extract frames ---
+    // ---------- VIDEO ANALYSIS PREP ----------
+    const keyTimes = await detectKeyMoments(req.file.path);
+    const keyMoments = keyTimes.slice(0, 10).map((t) => `${Math.round(t)}s`);
     const frameDir = path.join("uploads", `frames-${Date.now()}`);
     fs.mkdirSync(frameDir, { recursive: true });
+
     let frames = [];
-    try { frames = await extractFrames(videoFile.path, frameDir, Math.min(keyMoments.length || 5, 10)); } catch(e){ console.error("Frame extraction failed:", e); }
+    try {
+      frames = await extractFrames(req.file.path, frameDir, Math.min(keyMoments.length || 5, 10));
+    } catch (e) {
+      console.error("Frame extraction failed:", e);
+    }
 
-    // --- Step 3: Cleanup ---
-    try { frames.forEach(f=>fs.unlinkSync(f)); fs.rmdirSync(frameDir); fs.unlinkSync(videoFile.path); } catch(e){}
+    // Cleanup temporary files early
+    try {
+      frames.forEach((f) => fs.unlinkSync(f));
+      fs.rmSync(frameDir, { recursive: true, force: true });
+      fs.unlinkSync(req.file.path);
+    } catch (e) {}
 
-    // --- Step 4: Build GPT prompt including all settings ---
-    const analysisPrompt = `
-You are a professional ${game} gameplay analyst.
-Player Bio: ${bio || "No bio provided"}
-Focus Areas: ${parsedFocusAreas.join(", ")}
-Skill Level: ${skillLevel || "N/A"}
-Feedback Style: ${feedbackStyle || "N/A"}
+    // ---------- COST CONTROL ----------
+    const { model, tokens: max_tokens } = chooseModel(responseType, detailLevel);
+
+    // ---------- GPT PROMPT ----------
+    const prompt = `
+You are an expert ${game} gameplay analyst.
+Provide feedback in clear sections with short paragraphs.
+Only return readable text (no JSON).
+
+Game: ${game}
+Player Bio: ${playerBio || "N/A"}
+Skill Level: ${skillLevel || "Unknown"}
+Focus Areas: ${focusList.join(", ")}
 Clip Type: ${clipType || "N/A"}
+Feedback Style: ${feedbackStyle || "Balanced"}
 Language: ${language || "English"}
 Audio Included: ${audioInClip || "false"}
-Advanced Options: ${JSON.stringify(parsedAdvancedOptions)}
-Key Moments: ${keyMoments.length ? keyMoments.join(", ") : "No key moments detected"}
-Response Type: ${responseType}
 Detail Level: ${detailLevel}
-Provide a clean, readable analysis with spacing between sections.
+Extra Notes: ${extraNotes || "None"}
+Detected Key Moments: ${keyMoments.length ? keyMoments.join(", ") : "None"}
+
+Now produce a ${responseType}-style analysis focusing on improvement tips, strengths, and weak points.
 `;
 
-    const model = ["detailed","coach"].includes(responseType.toLowerCase()) ? "gpt-4o-mini" : "gpt-3.5-turbo";
-    const maxTokensMap = { short: 300, balanced: 600, detailed: 1200, coach: 1500 };
-    const max_tokens = maxTokensMap[responseType.toLowerCase()] || 600;
-
-    const aiResp = await openai.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model,
       messages: [
-        { role: "system", content: `You are a professional ${game} coach. Return plain formatted text only.` },
-        { role: "user", content: analysisPrompt }
+        { role: "system", content: "You are a professional gameplay coach providing concise, helpful analyses." },
+        { role: "user", content: prompt },
       ],
-      max_tokens
+      max_tokens,
+      temperature: 0.7,
     });
 
-    let cleanText = applyDynamicSpacing(aiResp.choices?.[0]?.message?.content || "No analysis returned");
+    const aiText = applyDynamicSpacing(
+      completion.choices?.[0]?.message?.content || "No analysis returned."
+    );
 
-    // --- Step 5: Generate charts ---
-    const baseStats = { accuracy: 80, positioning: 75, editing: 70, building: 65 };
-    const frameCount = frames.length || Math.min(keyMoments.length || 5, 10);
-    const generateTimeline = (base) => Array.from({ length: frameCount }, (_, i) => Math.min(100, Math.max(0, base + Math.round(Math.random()*10-5))));
+    // ---------- MOCK STATS + CHARTS ----------
+    const baseStats = { aim: 78, positioning: 82, movement: 75, editing: 70 };
+    const frameCount = 5;
+    const randomStats = (base) =>
+      Array.from({ length: frameCount }, (_, i) =>
+        Math.min(100, Math.max(0, base + Math.round(Math.random() * 8 - 4)))
+      );
 
-    let charts = [];
-    const focusTypes = parsedFocusAreas.length ? parsedFocusAreas.map(f => f.toLowerCase()) : ["overall"];
-    focusTypes.forEach((type) => {
-      charts.push({
-        label: type.charAt(0).toUpperCase() + type.slice(1),
-        labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i+1}`),
-        data: generateTimeline(baseStats[type] || 70)
-      });
-    });
+    const charts = focusList.map((area) => ({
+      label: area.charAt(0).toUpperCase() + area.slice(1),
+      labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i + 1}`),
+      data: randomStats(baseStats[area.toLowerCase()] || 70),
+    }));
 
     const responseData = {
       success: true,
-      analysis: cleanText,
-      keyMoments: keyMoments.join(", "),
-      frameCount,
+      game,
+      responseType,
+      detailLevel,
+      focusAreas: focusList,
+      skillLevel,
+      feedbackStyle,
+      clipType,
+      language,
+      analysis: aiText,
+      keyMoments,
       stats: baseStats,
       charts,
-      headline: "Gameplay Analysis",
-      cached: false
+      modelUsed: model,
+      cached: false,
     };
-    analysisCache.set(videoHash, responseData);
-    return res.json(responseData);
 
-  } catch (error) {
-    console.error("AI Analysis error:", error);
-    return res.status(500).json({ success: false, error: "Internal server error during analysis." });
+    analysisCache.set(videoHash, responseData);
+    res.json(responseData);
+  } catch (err) {
+    console.error("Error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Internal error during analysis",
+      details: err.message,
+    });
   }
 });
 
-// Root
-app.get("/", (req, res) => res.send("🎮 GPT-4o Game AI API with caching and cost optimization!"));
+// ---------- ROOT ----------
+app.get("/", (req, res) =>
+  res.send("🎮 Gameplay AI Analysis API — Optimized for cost & integrated fields.")
+);
 
-// Start server
+// ---------- START SERVER ----------
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => console.log(`✅ API running on port ${port}`));
