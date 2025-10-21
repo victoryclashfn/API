@@ -1,3 +1,15 @@
+/**
+ * Gameplay Analysis API — High-accuracy GPT-4o-mini Edition
+ * Improvements included:
+ * 1. Structured, weighted prompt
+ * 2. Key-moment context
+ * 3. Lower temperature (0.5)
+ * 4. Few-shot example
+ * 5. Mini reasoning pre-pass (cacheable)
+ * 6. Adaptive token limit
+ * 7. Persistent JSON cache
+ */
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -16,66 +28,74 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ---------- SIMPLE IN-MEMORY CACHE ----------
-const analysisCache = new Map();
+// ---------- PERSISTENT CACHE ----------
+const CACHE_FILE = path.resolve("analysisCache.json");
+let analysisCache = new Map();
+
+function loadCache() {
+  if (fs.existsSync(CACHE_FILE)) {
+    try {
+      analysisCache = new Map(
+        Object.entries(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")))
+      );
+      console.log(`✅ Loaded ${analysisCache.size} cached analyses`);
+    } catch (e) {
+      console.error("⚠️ Cache load failed:", e);
+    }
+  }
+}
+function saveCache() {
+  try {
+    fs.writeFileSync(
+      CACHE_FILE,
+      JSON.stringify(Object.fromEntries(analysisCache), null, 2)
+    );
+  } catch (e) {
+    console.error("⚠️ Cache save failed:", e);
+  }
+}
+loadCache();
 
 // ---------- HELPERS ----------
 function hashFile(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  return crypto.createHash("sha256").update(buffer).digest("hex");
+  const buf = fs.readFileSync(filePath);
+  return crypto.createHash("sha256").update(buf).digest("hex");
 }
-
 function extractFrames(videoPath, outputDir, count = 5) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i "${videoPath}" -vf "thumbnail,scale=640:360" -frames:v ${count} "${outputDir}/frame-%02d.png" -hide_banner -loglevel error`;
     exec(cmd, (err) => {
       if (err) return reject(err);
-      try {
-        const frames = fs
-          .readdirSync(outputDir)
-          .filter((f) => f.startsWith("frame-"))
-          .map((f) => `${outputDir}/${f}`);
-        resolve(frames);
-      } catch (e) {
-        reject(e);
-      }
+      const frames = fs
+        .readdirSync(outputDir)
+        .filter((f) => f.startsWith("frame-"))
+        .map((f) => `${outputDir}/${f}`);
+      resolve(frames);
     });
   });
 }
-
 function detectKeyMoments(videoPath) {
   return new Promise((resolve) => {
     const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
-    exec(cmd, (err, stdout, stderr) => {
+    exec(cmd, (err, _out, stderr) => {
       if (err) return resolve([]);
-      const matches = stderr.match(/pts_time:(\d+\.?\d*)/g) || [];
-      const times = matches.map((m) => parseFloat(m.replace("pts_time:", "")));
-      resolve(times.slice(0, 10)); // limit to 10 key moments
+      const times =
+        stderr.match(/pts_time:(\d+\.?\d*)/g)?.map((m) =>
+          parseFloat(m.replace("pts_time:", ""))
+        ) || [];
+      resolve(times.slice(0, 10));
     });
   });
 }
-
-function applyDynamicSpacing(text) {
-  return text
+function applyDynamicSpacing(t) {
+  return t
     .replace(/\n\s*\n/g, "\n\n")
     .replace(/([^\n])\n([^\n])/g, "$1\n\n$2")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-// ---------- COST-EFFICIENT MODEL SELECTOR ----------
-function chooseModel(responseType, detailLevel) {
-  const type = responseType?.toLowerCase() || "";
-  const detail = detailLevel?.toLowerCase() || "normal";
-
-  // gpt-4o-mini for pro / detailed users, gpt-3.5-turbo otherwise
-  if (["coaching", "detailed", "pro-coaching", "advanced"].includes(type)) {
-    return { model: "gpt-4o-mini", tokens: detail === "high" ? 1500 : 1000 };
-  }
-  return { model: "gpt-3.5-turbo", tokens: detail === "low" ? 400 : 700 };
-}
-
-// ---------- /analyze ENDPOINT ----------
+// ---------- MAIN ENDPOINT ----------
 app.post("/analyze", upload.single("video"), async (req, res) => {
   try {
     const {
@@ -92,12 +112,11 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       extraNotes,
     } = req.body;
 
-    if (!game || !responseType || !detailLevel || !req.file) {
+    if (!game || !responseType || !detailLevel || !req.file)
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: game, responseType, detailLevel, video",
+        error: "Missing required fields (game, responseType, detailLevel, video)",
       });
-    }
 
     const focusList =
       typeof focusAreas === "string"
@@ -113,72 +132,137 @@ app.post("/analyze", upload.single("video"), async (req, res) => {
       return res.json({ ...analysisCache.get(videoHash), cached: true });
     }
 
-    // ---------- VIDEO ANALYSIS PREP ----------
+    // ---------- VIDEO PREP ----------
     const keyTimes = await detectKeyMoments(req.file.path);
-    const keyMoments = keyTimes.slice(0, 10).map((t) => `${Math.round(t)}s`);
+    const keyMoments = keyTimes.map((t) => `${Math.round(t)}s`);
     const frameDir = path.join("uploads", `frames-${Date.now()}`);
     fs.mkdirSync(frameDir, { recursive: true });
-
     let frames = [];
     try {
-      frames = await extractFrames(req.file.path, frameDir, Math.min(keyMoments.length || 5, 10));
-    } catch (e) {
-      console.error("Frame extraction failed:", e);
-    }
-
-    // Cleanup temporary files early
+      frames = await extractFrames(
+        req.file.path,
+        frameDir,
+        Math.min(keyMoments.length || 5, 10)
+      );
+    } catch {}
     try {
       frames.forEach((f) => fs.unlinkSync(f));
       fs.rmSync(frameDir, { recursive: true, force: true });
       fs.unlinkSync(req.file.path);
-    } catch (e) {}
+    } catch {}
 
-    // ---------- COST CONTROL ----------
-    const { model, tokens: max_tokens } = chooseModel(responseType, detailLevel);
+    // ---------- CONTEXT BUILDING ----------
+    const weightedFocus = focusList
+      .map((f, i) => {
+        const weights = [40, 35, 25, 20, 15];
+        return `- ${f} (${weights[i] || 10}% importance)`;
+      })
+      .join("\n");
 
-    // ---------- GPT PROMPT ----------
+    const keyMomentContext =
+      keyMoments.length > 0
+        ? keyMoments
+            .map((t, i) => `Moment ${i + 1}: ${t} mark — possible key event.`)
+            .join("\n")
+        : "None detected.";
+
+    // ---------- FEW-SHOT EXAMPLE ----------
+    const example = `
+Example (Fortnite):
+[STRENGTHS]
+- Good crosshair tracking
+- Efficient 90° build transitions
+[WEAKNESSES]
+- Over-commits to height, loses cover
+[TIPS]
+- Prioritize retake efficiency over height control
+`;
+
+    // ---------- REASONING PRE-PASS ----------
+    const prepass = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an internal reasoning assistant. Extract 5 short bullet points capturing the core gameplay insights. Keep it under 100 words.",
+        },
+        {
+          role: "user",
+          content: `Game: ${game}\nFocus: ${focusList.join(
+            ", "
+          )}\nClip type: ${clipType}\nNotes: ${extraNotes}`,
+        },
+      ],
+      max_tokens: 200,
+      temperature: 0.4,
+    });
+    const reasoning =
+      prepass.choices?.[0]?.message?.content || "No reasoning generated.";
+
+    // ---------- FINAL PROMPT ----------
     const prompt = `
-You are an expert ${game} gameplay analyst.
-Provide feedback in clear sections with short paragraphs.
-Only return readable text (no JSON).
+You are an expert ${game} gameplay analyst and coach.
 
-Game: ${game}
+Follow this structured format exactly:
+[STRENGTHS]
+[List player strengths concisely]
+
+[WEAKNESSES]
+[List key weak points]
+
+[TIPS]
+[Give actionable, prioritized improvements]
+
+Analyze using this information:
 Player Bio: ${playerBio || "N/A"}
 Skill Level: ${skillLevel || "Unknown"}
-Focus Areas: ${focusList.join(", ")}
-Clip Type: ${clipType || "N/A"}
 Feedback Style: ${feedbackStyle || "Balanced"}
 Language: ${language || "English"}
 Audio Included: ${audioInClip || "false"}
 Detail Level: ${detailLevel}
-Extra Notes: ${extraNotes || "None"}
-Detected Key Moments: ${keyMoments.length ? keyMoments.join(", ") : "None"}
+Focus Areas (weighted):
+${weightedFocus}
+Key Moments:
+${keyMomentContext}
 
-Now produce a ${responseType}-style analysis focusing on improvement tips, strengths, and weak points.
+Internal reasoning summary:
+${reasoning}
+
+Use a clear, coach-like tone. Avoid repetition.
+
+${example}
 `;
 
+    // ---------- ADAPTIVE TOKENS ----------
+    const max_tokens = detailLevel === "high" ? 1500 : 1000;
+
+    // ---------- GPT-4o-mini ANALYSIS ----------
     const completion = await openai.chat.completions.create({
-      model,
+      model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a professional gameplay coach providing concise, helpful analyses." },
+        {
+          role: "system",
+          content:
+            "You are a professional gameplay coach providing high-accuracy, structured analysis.",
+        },
         { role: "user", content: prompt },
       ],
       max_tokens,
-      temperature: 0.7,
+      temperature: 0.5,
     });
 
     const aiText = applyDynamicSpacing(
       completion.choices?.[0]?.message?.content || "No analysis returned."
     );
 
-    // ---------- MOCK STATS + CHARTS ----------
+    // ---------- MOCK STATS ----------
     const baseStats = { aim: 78, positioning: 82, movement: 75, editing: 70 };
     const frameCount = 5;
     const randomStats = (base) =>
-      Array.from({ length: frameCount }, (_, i) =>
+      Array.from({ length: frameCount }, () =>
         Math.min(100, Math.max(0, base + Math.round(Math.random() * 8 - 4)))
       );
-
     const charts = focusList.map((area) => ({
       label: area.charAt(0).toUpperCase() + area.slice(1),
       labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i + 1}`),
@@ -199,27 +283,36 @@ Now produce a ${responseType}-style analysis focusing on improvement tips, stren
       keyMoments,
       stats: baseStats,
       charts,
-      modelUsed: model,
+      modelUsed: "gpt-4o-mini",
       cached: false,
     };
 
     analysisCache.set(videoHash, responseData);
+    saveCache();
+
     res.json(responseData);
   } catch (err) {
-    console.error("Error:", err);
-    res.status(500).json({
-      success: false,
-      error: "Internal error during analysis",
-      details: err.message,
-    });
+    console.error("❌ Error:", err);
+    res
+      .status(500)
+      .json({ success: false, error: "Internal error", details: err.message });
   }
 });
 
 // ---------- ROOT ----------
-app.get("/", (req, res) =>
-  res.send("🎮 Gameplay AI Analysis API — Optimized for cost & integrated fields.")
+app.get("/", (_req, res) =>
+  res.send(
+    "🎮 Gameplay AI Analysis API — GPT-4o-mini high-accuracy build with layered prompt & persistent cache."
+  )
 );
 
-// ---------- START SERVER ----------
+// ---------- SERVER ----------
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`✅ API running on port ${port}`));
+app.listen(port, () =>
+  console.log(`✅ API running on port ${port} (enhanced accuracy mode)`)
+);
+process.on("SIGINT", () => {
+  console.log("\n💾 Saving cache before exit...");
+  saveCache();
+  process.exit(0);
+});
