@@ -1,13 +1,9 @@
 /**
- * Gameplay Analysis API — High-accuracy GPT-4o-mini Edition
- * Improvements included:
- * 1. Structured, weighted prompt
- * 2. Key-moment context
- * 3. Lower temperature (0.5)
- * 4. Few-shot example
- * 5. Mini reasoning pre-pass (cacheable)
- * 6. Adaptive token limit
- * 7. Persistent JSON cache
+ * Gameplay Analysis API — GPT-4o-mini Edition
+ * Adds:
+ *  • In-memory job queue with MAX_CONCURRENT limit
+ *  • Live queue-position feedback
+ *  • Persists cache as before
  */
 
 import express from "express";
@@ -23,7 +19,6 @@ const app = express();
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------- BASIC MIDDLEWARE ----------
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -31,32 +26,74 @@ app.use(express.urlencoded({ extended: true }));
 // ---------- PERSISTENT CACHE ----------
 const CACHE_FILE = path.resolve("analysisCache.json");
 let analysisCache = new Map();
-
-function loadCache() {
-  if (fs.existsSync(CACHE_FILE)) {
-    try {
-      analysisCache = new Map(
-        Object.entries(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")))
-      );
-      console.log(`✅ Loaded ${analysisCache.size} cached analyses`);
-    } catch (e) {
-      console.error("⚠️ Cache load failed:", e);
-    }
+if (fs.existsSync(CACHE_FILE)) {
+  try {
+    analysisCache = new Map(
+      Object.entries(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")))
+    );
+    console.log(`✅ Loaded ${analysisCache.size} cached analyses`);
+  } catch (e) {
+    console.error("⚠️ Cache load failed:", e);
   }
 }
 function saveCache() {
-  try {
-    fs.writeFileSync(
-      CACHE_FILE,
-      JSON.stringify(Object.fromEntries(analysisCache), null, 2)
-    );
-  } catch (e) {
-    console.error("⚠️ Cache save failed:", e);
-  }
+  fs.writeFileSync(
+    CACHE_FILE,
+    JSON.stringify(Object.fromEntries(analysisCache), null, 2)
+  );
 }
-loadCache();
 
-// ---------- HELPERS ----------
+// ---------- SIMPLE IN-MEMORY QUEUE ----------
+const queue = [];
+let running = 0;
+const MAX_CONCURRENT = 3; // adjust for your server
+
+async function enqueue(jobFn, res) {
+  return new Promise((resolve, reject) => {
+    const job = { jobFn, res, resolve, reject, id: crypto.randomUUID() };
+    queue.push(job);
+
+    const position = queue.length;
+    // If server is busy, immediately tell user their place
+    if (running >= MAX_CONCURRENT) {
+      res.json({
+        queued: true,
+        position,
+        message: `⏳ Your clip is in queue — position #${position}.`,
+      });
+    }
+
+    processNext();
+  });
+}
+
+async function processNext() {
+  if (running >= MAX_CONCURRENT || queue.length === 0) return;
+  const job = queue.shift();
+  running++;
+  job
+    .jobFn()
+    .then((result) => {
+      // Only send here if not already sent (for queued users)
+      if (!job.res.headersSent)
+        job.res.json({ queued: false, ...result });
+      job.resolve(result);
+    })
+    .catch((err) => {
+      console.error("❌ Job error:", err);
+      if (!job.res.headersSent)
+        job.res
+          .status(500)
+          .json({ success: false, error: "Internal error", details: err.message });
+      job.reject(err);
+    })
+    .finally(() => {
+      running--;
+      processNext();
+    });
+}
+
+// ---------- UTILITIES ----------
 function hashFile(filePath) {
   const buf = fs.readFileSync(filePath);
   return crypto.createHash("sha256").update(buf).digest("hex");
@@ -80,7 +117,7 @@ function detectKeyMoments(videoPath) {
     exec(cmd, (err, _out, stderr) => {
       if (err) return resolve([]);
       const times =
-        stderr.match(/pts_time:(\d+\.?\d*)/g)?.map((m) =>
+        stderr.match(/pts_time:(\\d+\\.?\\d*)/g)?.map((m) =>
           parseFloat(m.replace("pts_time:", ""))
         ) || [];
       resolve(times.slice(0, 10));
@@ -89,85 +126,77 @@ function detectKeyMoments(videoPath) {
 }
 function applyDynamicSpacing(t) {
   return t
-    .replace(/\n\s*\n/g, "\n\n")
-    .replace(/([^\n])\n([^\n])/g, "$1\n\n$2")
-    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\\n\\s*\\n/g, "\\n\\n")
+    .replace(/([^\\n])\\n([^\\n])/g, "$1\\n\\n$2")
+    .replace(/\\n{3,}/g, "\\n\\n")
     .trim();
 }
 
-// ---------- MAIN ENDPOINT ----------
-app.post("/analyze", upload.single("video"), async (req, res) => {
+// ---------- ANALYSIS HANDLER ----------
+async function handleAnalysis(req) {
+  const {
+    game,
+    responseType,
+    focusAreas,
+    detailLevel,
+    skillLevel,
+    feedbackStyle,
+    clipType,
+    language,
+    audioInClip,
+    playerBio,
+    extraNotes,
+  } = req.body;
+
+  if (!game || !responseType || !detailLevel || !req.file) {
+    return {
+      success: false,
+      error: "Missing required fields: game, responseType, detailLevel, video",
+    };
+  }
+
+  const focusList =
+    typeof focusAreas === "string"
+      ? focusAreas.split(",").map((s) => s.trim())
+      : Array.isArray(focusAreas)
+      ? focusAreas
+      : ["overall"];
+
+  const videoHash = hashFile(req.file.path);
+  if (analysisCache.has(videoHash)) {
+    fs.unlinkSync(req.file.path);
+    return { ...analysisCache.get(videoHash), cached: true };
+  }
+
+  const keyTimes = await detectKeyMoments(req.file.path);
+  const keyMoments = keyTimes.map((t) => `${Math.round(t)}s`);
+  const frameDir = path.join("uploads", `frames-${Date.now()}`);
+  fs.mkdirSync(frameDir, { recursive: true });
+  let frames = [];
   try {
-    const {
-      game,
-      responseType,
-      focusAreas,
-      detailLevel,
-      skillLevel,
-      feedbackStyle,
-      clipType,
-      language,
-      audioInClip,
-      playerBio,
-      extraNotes,
-    } = req.body;
+    frames = await extractFrames(req.file.path, frameDir, Math.min(keyMoments.length || 5, 10));
+  } catch {}
+  try {
+    frames.forEach((f) => fs.unlinkSync(f));
+    fs.rmSync(frameDir, { recursive: true, force: true });
+    fs.unlinkSync(req.file.path);
+  } catch {}
 
-    if (!game || !responseType || !detailLevel || !req.file)
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields (game, responseType, detailLevel, video)",
-      });
+  const weightedFocus = focusList
+    .map((f, i) => {
+      const weights = [40, 35, 25, 20, 15];
+      return `- ${f} (${weights[i] || 10}% importance)`;
+    })
+    .join("\\n");
 
-    const focusList =
-      typeof focusAreas === "string"
-        ? focusAreas.split(",").map((s) => s.trim())
-        : Array.isArray(focusAreas)
-        ? focusAreas
-        : ["overall"];
+  const keyMomentContext =
+    keyMoments.length > 0
+      ? keyMoments
+          .map((t, i) => `Moment ${i + 1}: ${t} mark — possible key event.`)
+          .join("\\n")
+      : "None detected.";
 
-    // ---------- CACHE ----------
-    const videoHash = hashFile(req.file.path);
-    if (analysisCache.has(videoHash)) {
-      fs.unlinkSync(req.file.path);
-      return res.json({ ...analysisCache.get(videoHash), cached: true });
-    }
-
-    // ---------- VIDEO PREP ----------
-    const keyTimes = await detectKeyMoments(req.file.path);
-    const keyMoments = keyTimes.map((t) => `${Math.round(t)}s`);
-    const frameDir = path.join("uploads", `frames-${Date.now()}`);
-    fs.mkdirSync(frameDir, { recursive: true });
-    let frames = [];
-    try {
-      frames = await extractFrames(
-        req.file.path,
-        frameDir,
-        Math.min(keyMoments.length || 5, 10)
-      );
-    } catch {}
-    try {
-      frames.forEach((f) => fs.unlinkSync(f));
-      fs.rmSync(frameDir, { recursive: true, force: true });
-      fs.unlinkSync(req.file.path);
-    } catch {}
-
-    // ---------- CONTEXT BUILDING ----------
-    const weightedFocus = focusList
-      .map((f, i) => {
-        const weights = [40, 35, 25, 20, 15];
-        return `- ${f} (${weights[i] || 10}% importance)`;
-      })
-      .join("\n");
-
-    const keyMomentContext =
-      keyMoments.length > 0
-        ? keyMoments
-            .map((t, i) => `Moment ${i + 1}: ${t} mark — possible key event.`)
-            .join("\n")
-        : "None detected.";
-
-    // ---------- FEW-SHOT EXAMPLE ----------
-    const example = `
+  const example = `
 Example (Fortnite):
 [STRENGTHS]
 - Good crosshair tracking
@@ -178,30 +207,26 @@ Example (Fortnite):
 - Prioritize retake efficiency over height control
 `;
 
-    // ---------- REASONING PRE-PASS ----------
-    const prepass = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an internal reasoning assistant. Extract 5 short bullet points capturing the core gameplay insights. Keep it under 100 words.",
-        },
-        {
-          role: "user",
-          content: `Game: ${game}\nFocus: ${focusList.join(
-            ", "
-          )}\nClip type: ${clipType}\nNotes: ${extraNotes}`,
-        },
-      ],
-      max_tokens: 200,
-      temperature: 0.4,
-    });
-    const reasoning =
-      prepass.choices?.[0]?.message?.content || "No reasoning generated.";
+  // ---------- MINI REASONING ----------
+  const prepass = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an internal reasoning assistant. Extract 5 bullet points capturing core gameplay insights. Keep under 100 words.",
+      },
+      {
+        role: "user",
+        content: `Game: ${game}\\nFocus: ${focusList.join(", ")}\\nClip type: ${clipType}\\nNotes: ${extraNotes}`,
+      },
+    ],
+    max_tokens: 200,
+    temperature: 0.4,
+  });
+  const reasoning = prepass.choices?.[0]?.message?.content || "No reasoning generated.";
 
-    // ---------- FINAL PROMPT ----------
-    const prompt = `
+  const prompt = `
 You are an expert ${game} gameplay analyst and coach.
 
 Follow this structured format exactly:
@@ -234,85 +259,77 @@ Use a clear, coach-like tone. Avoid repetition.
 ${example}
 `;
 
-    // ---------- ADAPTIVE TOKENS ----------
-    const max_tokens = detailLevel === "high" ? 1500 : 1000;
+  const max_tokens = detailLevel === "high" ? 1500 : 1000;
 
-    // ---------- GPT-4o-mini ANALYSIS ----------
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a professional gameplay coach providing high-accuracy, structured analysis.",
-        },
-        { role: "user", content: prompt },
-      ],
-      max_tokens,
-      temperature: 0.5,
-    });
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a professional gameplay coach providing high-accuracy structured analysis.",
+      },
+      { role: "user", content: prompt },
+    ],
+    max_tokens,
+    temperature: 0.5,
+  });
 
-    const aiText = applyDynamicSpacing(
-      completion.choices?.[0]?.message?.content || "No analysis returned."
+  const aiText = applyDynamicSpacing(
+    completion.choices?.[0]?.message?.content || "No analysis returned."
+  );
+
+  const baseStats = { aim: 78, positioning: 82, movement: 75, editing: 70 };
+  const frameCount = 5;
+  const randomStats = (base) =>
+    Array.from({ length: frameCount }, () =>
+      Math.min(100, Math.max(0, base + Math.round(Math.random() * 8 - 4)))
     );
+  const charts = focusList.map((area) => ({
+    label: area.charAt(0).toUpperCase() + area.slice(1),
+    labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i + 1}`),
+    data: randomStats(baseStats[area.toLowerCase()] || 70),
+  }));
 
-    // ---------- MOCK STATS ----------
-    const baseStats = { aim: 78, positioning: 82, movement: 75, editing: 70 };
-    const frameCount = 5;
-    const randomStats = (base) =>
-      Array.from({ length: frameCount }, () =>
-        Math.min(100, Math.max(0, base + Math.round(Math.random() * 8 - 4)))
-      );
-    const charts = focusList.map((area) => ({
-      label: area.charAt(0).toUpperCase() + area.slice(1),
-      labels: Array.from({ length: frameCount }, (_, i) => `Frame ${i + 1}`),
-      data: randomStats(baseStats[area.toLowerCase()] || 70),
-    }));
+  const responseData = {
+    success: true,
+    game,
+    responseType,
+    detailLevel,
+    focusAreas: focusList,
+    skillLevel,
+    feedbackStyle,
+    clipType,
+    language,
+    analysis: aiText,
+    keyMoments,
+    stats: baseStats,
+    charts,
+    modelUsed: "gpt-4o-mini",
+    cached: false,
+  };
 
-    const responseData = {
-      success: true,
-      game,
-      responseType,
-      detailLevel,
-      focusAreas: focusList,
-      skillLevel,
-      feedbackStyle,
-      clipType,
-      language,
-      analysis: aiText,
-      keyMoments,
-      stats: baseStats,
-      charts,
-      modelUsed: "gpt-4o-mini",
-      cached: false,
-    };
+  analysisCache.set(videoHash, responseData);
+  saveCache();
 
-    analysisCache.set(videoHash, responseData);
-    saveCache();
+  return responseData;
+}
 
-    res.json(responseData);
-  } catch (err) {
-    console.error("❌ Error:", err);
-    res
-      .status(500)
-      .json({ success: false, error: "Internal error", details: err.message });
-  }
+// ---------- ENDPOINT ----------
+app.post("/analyze", upload.single("video"), async (req, res) => {
+  await enqueue(() => handleAnalysis(req), res);
 });
 
-// ---------- ROOT ----------
 app.get("/", (_req, res) =>
-  res.send(
-    "🎮 Gameplay AI Analysis API — GPT-4o-mini high-accuracy build with layered prompt & persistent cache."
-  )
+  res.send("🎮 Gameplay AI Analysis API — high-accuracy build with queue & cache.")
 );
 
-// ---------- SERVER ----------
 const port = process.env.PORT || 3000;
 app.listen(port, () =>
-  console.log(`✅ API running on port ${port} (enhanced accuracy mode)`)
+  console.log(`✅ API running on port ${port} (queued mode, max ${MAX_CONCURRENT} concurrent jobs)`)
 );
 process.on("SIGINT", () => {
-  console.log("\n💾 Saving cache before exit...");
+  console.log("\\n💾 Saving cache before exit...");
   saveCache();
   process.exit(0);
 });
