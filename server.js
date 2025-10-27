@@ -1,11 +1,10 @@
 /**
- * Gameplay Analysis API — Vision + Security Edition (WordPress-compatible)
- * - API key auth (x-gamescan-key) + nonce (x-analysis-nonce)
- * - Optional nonce verification via WordPress REST
- * - Allowed origin check
- * - Per-IP rate limiting
- * - In-memory queue + persistent cache
- * - Tier-based model & frame scaling
+ * Gamescan — Dev Bypass Edition (Quick, insecure dev mode)
+ *
+ * NOTES:
+ *  - This version REMOVES the security middleware from the /analyze route.
+ *  - Do NOT use this on a public server long-term.
+ *  - Re-enable security by restoring `securityCheck` into the route middleware list.
  */
 
 import express from "express";
@@ -15,29 +14,24 @@ import fs from "fs";
 import path from "path";
 import { exec } from "child_process";
 import crypto from "crypto";
-import fetch from "node-fetch";
 import OpenAI from "openai";
+
+import "dotenv/config"; // load .env in local dev (optional)
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ====== ENV / CONFIG ======
-const API_KEY = process.env.GAMESCAN_API_KEY || "";
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-const VERIFY_NONCE_URL = process.env.VERIFY_NONCE_URL || ""; // e.g. https://yourdomain.com/wp-json/gamescan/v1/verify_nonce?nonce=
+// ---------- CONFIG ----------
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "3", 10);
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
-// ====== BASE MIDDLEWARE ======
+// ---------- BASIC MIDDLEWARE ----------
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
-app.use(cors({ origin: (origin, cb) => cb(null, true) })); // fine; we still hard-check origin below
+app.use(cors()); // permissive for dev
 
-// ====== CACHE ======
+// ---------- SIMPLE IN-MEMORY CACHE ----------
 const CACHE_FILE = path.resolve("analysisCache.json");
 let analysisCache = new Map();
 if (fs.existsSync(CACHE_FILE)) {
@@ -52,10 +46,10 @@ function saveCache() {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(analysisCache), null, 2));
 }
 
-// ====== SIMPLE RATE LIMIT (per-IP) ======
-const rateBuckets = new Map(); // ip -> timestamps[]
-const RATE_WINDOW_MS = 60_000; // 1 min
-const RATE_MAX = 10;           // 10 req/min
+// ---------- RATE LIMIT (simple, per-ip) ----------
+const rateBuckets = new Map();
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX = 20; // allow more in dev
 
 function rateLimit(req, res, next) {
   const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.ip || "unknown";
@@ -69,7 +63,7 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// ====== QUEUE ======
+// ---------- QUEUE ----------
 const queue = [];
 let running = 0;
 
@@ -79,6 +73,7 @@ async function enqueue(jobFn, res) {
     queue.push(job);
     const position = queue.length;
     if (running >= MAX_CONCURRENT) {
+      // Immediately inform caller they're queued (developer UX)
       res.json({
         queued: true,
         position,
@@ -111,7 +106,7 @@ async function processNext() {
     });
 }
 
-// ====== UTILS ======
+// ---------- UTILITIES ----------
 function hashFile(filePath) {
   const buf = fs.readFileSync(filePath);
   return crypto.createHash("sha256").update(buf).digest("hex");
@@ -149,51 +144,13 @@ function extractFrames(videoPath, outputDir, count = 5, scale = "640:-1") {
   });
 }
 
-// ====== SECURITY MIDDLEWARE (Origin + Key + Nonce) ======
-async function securityCheck(req, res, next) {
-  // Origin allowlist (best-effort—server-to-server calls may not set Origin; we accept if API key ok)
-  const originHeader = (req.headers.origin || req.headers.referer || req.headers.origin_url || "").toString();
-  if (ALLOWED_ORIGINS.length > 0 && originHeader) {
-    const ok = ALLOWED_ORIGINS.some(o => originHeader.startsWith(o));
-    if (!ok) {
-      return res.status(403).json({ success: false, error: "Origin not allowed" });
-    }
-  }
+// ---------- (DEV) SECURITY BYPASS — removed from route ----------
+// NOTE: The production security middleware exists in your prior version.
+// For this DEV BYPASS release, we intentionally do not call it on /analyze.
+// Make sure to restore it later.
 
-  // API Key (required)
-  const providedKey = req.headers["x-gamescan-key"];
-  if (!API_KEY || !providedKey || providedKey !== API_KEY) {
-    return res.status(401).json({ success: false, error: "Invalid or missing API key" });
-  }
-
-  // Nonce (required)
-  const nonce = req.headers["x-analysis-nonce"];
-  if (!nonce || String(nonce).length < 8) {
-    return res.status(400).json({ success: false, error: "Missing or invalid nonce" });
-  }
-
-  // Optional: verify nonce via WordPress REST
-  if (VERIFY_NONCE_URL) {
-    try {
-      const url = `${VERIFY_NONCE_URL}${encodeURIComponent(String(nonce))}`;
-      const r = await fetch(url, { timeout: 8000 });
-      const data = await r.json();
-      if (!data || data.valid !== true) {
-        return res.status(401).json({ success: false, error: "Nonce verification failed" });
-      }
-    } catch (e) {
-      return res.status(502).json({ success: false, error: "Nonce verification error" });
-    }
-  }
-
-  next();
-}
-
-// ====== CORE ANALYSIS ======
+// ---------- CORE ANALYSIS FUNCTION ----------
 async function handleAnalysis(req) {
-  // Expect fields from WP PHP:
-  // file field name: "video"
-  // responseType, focusAreas (JSON string or array), game, clipType, language, feedbackStyle
   const {
     responseType,
     game,
@@ -205,39 +162,33 @@ async function handleAnalysis(req) {
     audioInClip = "false",
     playerBio = "",
     extraNotes = "",
-    userTier = "free" // optional; can be passed via extra body/header later
+    userTier = "free"
   } = req.body;
 
   if (!req.file || !game || !responseType) {
-    return { success: false, error: "Missing required fields: game, responseType, and video file" };
+    return { success: false, error: "Missing required fields: game, responseType, video file" };
   }
 
-  // focusAreas can arrive as JSON string from WP bridge
+  // focusAreas can be JSON-string or array
   let focusAreas = req.body.focusAreas;
-  try {
-    if (typeof focusAreas === "string") focusAreas = JSON.parse(focusAreas);
-  } catch {
-    /* ignore */ 
-  }
-  const focusList = Array.isArray(focusAreas)
-    ? focusAreas.map(s => (typeof s === "string" ? s.trim() : String(s)))
-    : ["overall"];
+  try { if (typeof focusAreas === "string") focusAreas = JSON.parse(focusAreas); } catch {}
+  const focusList = Array.isArray(focusAreas) ? focusAreas.map(s => (typeof s === "string" ? s.trim() : String(s))) : ["overall"];
 
-  // cache
+  // check cache
   const videoHash = hashFile(req.file.path);
   if (analysisCache.has(videoHash)) {
-    fs.unlinkSync(req.file.path);
+    try { fs.unlinkSync(req.file.path); } catch {}
     return { ...analysisCache.get(videoHash), cached: true };
   }
 
-  // key moments + frames
+  // detect key moments and extract frames
   const keyTimes = await detectKeyMoments(req.file.path);
-  const keyMoments = keyTimes.map((t) => `${Math.round(t)}s`);
+  const keyMoments = keyTimes.map(t => `${Math.round(t)}s`);
 
   const frameDir = path.join("uploads", `frames-${Date.now()}`);
   fs.mkdirSync(frameDir, { recursive: true });
 
-  // Tier-based scaling (feel free to adjust)
+  // tier-based settings
   const scale = userTier === "master" ? "1280:-1" : userTier === "pro" ? "720:-1" : "640:-1";
   const frameCount = userTier === "master" ? 8 : userTier === "pro" ? 5 : 3;
 
@@ -246,12 +197,13 @@ async function handleAnalysis(req) {
   // remove original upload to save space
   try { fs.unlinkSync(req.file.path); } catch {}
 
-  // Model choice
+  // model selection
   const model =
-    userTier === "master" ? "gpt-4.1"
-    : userTier === "pro" ? "gpt-4o"
-    : "gpt-4o-mini";
+    userTier === "master" ? "gpt-4.1" :
+    userTier === "pro" ? "gpt-4o" :
+    "gpt-4o-mini";
 
+  // prompt building
   const weightedFocus = focusList
     .map((f, i) => {
       const weights = [40, 30, 20, 15, 10];
@@ -288,14 +240,13 @@ Output format (use exactly these sections):
 [TIPS]
 `;
 
-  // Build image inputs (note: many setups work fine with file://; switch to signed HTTP URLs if needed)
+  // prepare images for the model (file:// works for many setups; swap to signed HTTP URLs if needed)
   const imageInputs = frames.map((filePath, idx) => ({
     type: "image_url",
     image_url: `file://${path.resolve(filePath)}`,
-    // Optionally add a caption "Frame N"
-    // caption: `Frame ${idx + 1}`
   }));
 
+  // call OpenAI
   const completion = await openai.chat.completions.create({
     model,
     messages: [
@@ -309,11 +260,9 @@ Output format (use exactly these sections):
     temperature: 0.4,
   });
 
-  const aiText = applyDynamicSpacing(
-    completion.choices?.[0]?.message?.content || "No analysis returned."
-  );
+  const aiText = applyDynamicSpacing(completion.choices?.[0]?.message?.content || "No analysis returned.");
 
-  // Example stats/charts (placeholder logic)
+  // mock stats & charts
   const baseStats = { aim: 80, positioning: 82, movement: 78, editing: 75 };
   const randomStats = (base) =>
     Array.from({ length: frameCount }, () =>
@@ -350,31 +299,36 @@ Output format (use exactly these sections):
   try {
     frames.forEach((f) => fs.unlinkSync(f));
     fs.rmSync(frameDir, { recursive: true, force: true });
-  } catch {}
+  } catch (e) {}
 
-  // cache & save
+  // cache & persist
   analysisCache.set(videoHash, responseData);
   saveCache();
 
   return responseData;
 }
 
-// ====== ROUTES ======
-app.get("/", (_req, res) =>
-  res.send("🎮 Gamescan — Secure Vision Gameplay Analysis API (WP-ready)")
-);
+// ---------- ROUTES ----------
 
-// Analyze endpoint — protected
-app.post("/analyze", rateLimit, securityCheck, upload.single("video"), async (req, res) => {
+app.get("/", (_req, res) =>
+  res.send("🎮 Gamescan — Dev Bypass API (no auth on /analyze)"));
+
+/**
+ * IMPORTANT: This route intentionally omits the securityCheck middleware so devs
+ * can test without the shared API key or nonce.
+ *
+ * Reintroduce the security middleware before going to production.
+ */
+app.post("/analyze", rateLimit, upload.single("video"), async (req, res) => {
   await enqueue(() => handleAnalysis(req), res);
 });
 
-// ====== START ======
+// ---------- START SERVER ----------
 app.listen(PORT, () => {
-  console.log(`✅ API running on port ${PORT} — max ${MAX_CONCURRENT} concurrent jobs`);
+  console.log(`✅ Dev Gamescan API running on port ${PORT} — max ${MAX_CONCURRENT} concurrent jobs`);
 });
 
-// Graceful shutdown
+// graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n💾 Saving cache before exit...");
   saveCache();
