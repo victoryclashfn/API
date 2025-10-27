@@ -4,7 +4,7 @@
  * NOTES:
  *  - This version REMOVES the security middleware from the /analyze route.
  *  - Do NOT use this on a public server long-term.
- *  - Re-enable security by restoring `securityCheck` into the route middleware list.
+ *  - Re-enable it before production.
  */
 
 import express from "express";
@@ -15,8 +15,7 @@ import path from "path";
 import { exec } from "child_process";
 import crypto from "crypto";
 import OpenAI from "openai";
-
-import "dotenv/config"; // load .env in local dev (optional)
+import "dotenv/config"; // load .env for local dev
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -29,9 +28,9 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 // ---------- BASIC MIDDLEWARE ----------
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
-app.use(cors()); // permissive for dev
+app.use(cors()); // dev-friendly CORS
 
-// ---------- SIMPLE IN-MEMORY CACHE ----------
+// ---------- CACHE ----------
 const CACHE_FILE = path.resolve("analysisCache.json");
 let analysisCache = new Map();
 if (fs.existsSync(CACHE_FILE)) {
@@ -46,55 +45,46 @@ function saveCache() {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(analysisCache), null, 2));
 }
 
-// ---------- RATE LIMIT (simple, per-ip) ----------
+// ---------- RATE LIMIT ----------
 const rateBuckets = new Map();
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX = 20; // allow more in dev
-
+const RATE_MAX = 20;
 function rateLimit(req, res, next) {
   const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.ip || "unknown";
   const now = Date.now();
-  const arr = (rateBuckets.get(ip) || []).filter(t => now - t < RATE_WINDOW_MS);
-  if (arr.length >= RATE_MAX) {
+  const arr = (rateBuckets.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (arr.length >= RATE_MAX)
     return res.status(429).json({ success: false, error: "Too many requests, slow down." });
-  }
   arr.push(now);
   rateBuckets.set(ip, arr);
   next();
 }
 
-// ---------- QUEUE ----------
+// ---------- JOB QUEUE ----------
 const queue = [];
 let running = 0;
-
 async function enqueue(jobFn, res) {
   return new Promise((resolve, reject) => {
     const job = { jobFn, res, resolve, reject, id: crypto.randomUUID() };
     queue.push(job);
     const position = queue.length;
     if (running >= MAX_CONCURRENT) {
-      // Immediately inform caller they're queued (developer UX)
-      res.json({
-        queued: true,
-        position,
-        message: `⏳ Your clip is in queue — position #${position}.`,
-      });
+      res.json({ queued: true, position, message: `⏳ In queue — position #${position}.` });
     }
     processNext();
   });
 }
-
 async function processNext() {
   if (running >= MAX_CONCURRENT || queue.length === 0) return;
   const job = queue.shift();
   running++;
   job
     .jobFn()
-    .then(result => {
+    .then((result) => {
       if (!job.res.headersSent) job.res.json({ queued: false, ...result });
       job.resolve(result);
     })
-    .catch(err => {
+    .catch((err) => {
       console.error("❌ Job error:", err);
       if (!job.res.headersSent)
         job.res.status(500).json({ success: false, error: "Internal error", details: err.message });
@@ -119,7 +109,7 @@ function applyDynamicSpacing(t) {
     .trim();
 }
 function detectKeyMoments(videoPath) {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -f null -`;
     exec(cmd, (err, _out, stderr) => {
       if (err) return resolve([]);
@@ -144,12 +134,7 @@ function extractFrames(videoPath, outputDir, count = 5, scale = "640:-1") {
   });
 }
 
-// ---------- (DEV) SECURITY BYPASS — removed from route ----------
-// NOTE: The production security middleware exists in your prior version.
-// For this DEV BYPASS release, we intentionally do not call it on /analyze.
-// Make sure to restore it later.
-
-// ---------- CORE ANALYSIS FUNCTION ----------
+// ---------- MAIN ANALYSIS ----------
 async function handleAnalysis(req) {
   const {
     responseType,
@@ -162,48 +147,72 @@ async function handleAnalysis(req) {
     audioInClip = "false",
     playerBio = "",
     extraNotes = "",
-    userTier = "free"
+    userTier = "free",
   } = req.body;
 
   if (!req.file || !game || !responseType) {
     return { success: false, error: "Missing required fields: game, responseType, video file" };
   }
 
-  // focusAreas can be JSON-string or array
+  // Focus parsing
   let focusAreas = req.body.focusAreas;
-  try { if (typeof focusAreas === "string") focusAreas = JSON.parse(focusAreas); } catch {}
-  const focusList = Array.isArray(focusAreas) ? focusAreas.map(s => (typeof s === "string" ? s.trim() : String(s))) : ["overall"];
+  try {
+    if (typeof focusAreas === "string") focusAreas = JSON.parse(focusAreas);
+  } catch {}
+  const focusList = Array.isArray(focusAreas)
+    ? focusAreas.map((s) => (typeof s === "string" ? s.trim() : String(s)))
+    : ["overall"];
 
-  // check cache
+  // Cache
   const videoHash = hashFile(req.file.path);
   if (analysisCache.has(videoHash)) {
-    try { fs.unlinkSync(req.file.path); } catch {}
+    try {
+      fs.unlinkSync(req.file.path);
+    } catch {}
     return { ...analysisCache.get(videoHash), cached: true };
   }
 
-  // detect key moments and extract frames
+  // Detect key moments + extract frames
   const keyTimes = await detectKeyMoments(req.file.path);
-  const keyMoments = keyTimes.map(t => `${Math.round(t)}s`);
+  const keyMoments = keyTimes.map((t) => `${Math.round(t)}s`);
 
   const frameDir = path.join("uploads", `frames-${Date.now()}`);
   fs.mkdirSync(frameDir, { recursive: true });
 
-  // tier-based settings
-  const scale = userTier === "master" ? "1280:-1" : userTier === "pro" ? "720:-1" : "640:-1";
-  const frameCount = userTier === "master" ? 8 : userTier === "pro" ? 5 : 3;
+  // Dynamic resolution / frames
+  let scale = "640:-1";
+  let frameCount = 3;
+
+  if (detailLevel === "high") {
+    scale = "960:-1";
+    frameCount = 6;
+  }
+  if (userTier === "pro" && detailLevel === "high") {
+    scale = "1280:-1";
+    frameCount = 8;
+  }
+  if (userTier === "master") {
+    scale = "1280:-1";
+    frameCount = detailLevel === "high" ? 10 : 8;
+  }
 
   const frames = await extractFrames(req.file.path, frameDir, frameCount, scale);
 
-  // remove original upload to save space
-  try { fs.unlinkSync(req.file.path); } catch {}
+  try {
+    fs.unlinkSync(req.file.path);
+  } catch {}
 
-  // model selection
-  const model =
-    userTier === "master" ? "gpt-4.1" :
-    userTier === "pro" ? "gpt-4o" :
-    "gpt-4o-mini";
+  // ==== MODEL SELECTION (based on detailLevel + tier) ====
+  let model = "gpt-4o-mini"; // default
+  if (detailLevel === "high") {
+    model = userTier === "master" ? "gpt-4.1" : "gpt-4o";
+  } else {
+    if (userTier === "master") model = "gpt-4o";
+  }
 
-  // prompt building
+  console.log(`🎯 Using model ${model} (tier=${userTier}, detail=${detailLevel})`);
+
+  // Prompt
   const weightedFocus = focusList
     .map((f, i) => {
       const weights = [40, 30, 20, 15, 10];
@@ -213,14 +222,15 @@ async function handleAnalysis(req) {
 
   const prompt = `
 You are an expert ${game} gameplay coach. Analyze the provided frames.
+
 Focus on:
 - Aiming/tracking/recoil control
 - Building/edit timing (if applicable)
 - Positioning & cover usage
 - Decision-making & game sense
-- Specific, actionable tips
+- Actionable, prioritized improvement tips
 
-Reference frames as "Frame 1..N" where helpful.
+Reference frames as "Frame 1..N" when useful.
 
 Context:
 Skill Level: ${skillLevel}
@@ -240,29 +250,28 @@ Output format (use exactly these sections):
 [TIPS]
 `;
 
-  // prepare images for the model (file:// works for many setups; swap to signed HTTP URLs if needed)
-  const imageInputs = frames.map((filePath, idx) => ({
+  // Vision input
+  const imageInputs = frames.map((filePath) => ({
     type: "image_url",
     image_url: `file://${path.resolve(filePath)}`,
   }));
 
-  // call OpenAI
+  // ==== OpenAI call ====
   const completion = await openai.chat.completions.create({
     model,
     messages: [
       { role: "system", content: "You are a professional gameplay analyst." },
-      {
-        role: "user",
-        content: [{ type: "text", text: prompt }, ...imageInputs],
-      },
+      { role: "user", content: [{ type: "text", text: prompt }, ...imageInputs] },
     ],
     max_tokens: detailLevel === "high" ? 1500 : 1000,
     temperature: 0.4,
   });
 
-  const aiText = applyDynamicSpacing(completion.choices?.[0]?.message?.content || "No analysis returned.");
+  const aiText = applyDynamicSpacing(
+    completion.choices?.[0]?.message?.content || "No analysis returned."
+  );
 
-  // mock stats & charts
+  // Mock stats / charts
   const baseStats = { aim: 80, positioning: 82, movement: 78, editing: 75 };
   const randomStats = (base) =>
     Array.from({ length: frameCount }, () =>
@@ -295,13 +304,11 @@ Output format (use exactly these sections):
     cached: false,
   };
 
-  // cleanup frames
   try {
     frames.forEach((f) => fs.unlinkSync(f));
     fs.rmSync(frameDir, { recursive: true, force: true });
   } catch (e) {}
 
-  // cache & persist
   analysisCache.set(videoHash, responseData);
   saveCache();
 
@@ -309,26 +316,18 @@ Output format (use exactly these sections):
 }
 
 // ---------- ROUTES ----------
-
 app.get("/", (_req, res) =>
-  res.send("🎮 Gamescan — Dev Bypass API (no auth on /analyze)"));
+  res.send("🎮 Gamescan — Dev Bypass API (dynamic model + detail scaling)")
+);
 
-/**
- * IMPORTANT: This route intentionally omits the securityCheck middleware so devs
- * can test without the shared API key or nonce.
- *
- * Reintroduce the security middleware before going to production.
- */
 app.post("/analyze", rateLimit, upload.single("video"), async (req, res) => {
   await enqueue(() => handleAnalysis(req), res);
 });
 
-// ---------- START SERVER ----------
-app.listen(PORT, () => {
-  console.log(`✅ Dev Gamescan API running on port ${PORT} — max ${MAX_CONCURRENT} concurrent jobs`);
-});
-
-// graceful shutdown
+// ---------- START ----------
+app.listen(PORT, () =>
+  console.log(`✅ Dev Gamescan API running on port ${PORT} (max ${MAX_CONCURRENT})`)
+);
 process.on("SIGINT", () => {
   console.log("\n💾 Saving cache before exit...");
   saveCache();
