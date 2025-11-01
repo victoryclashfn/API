@@ -42,19 +42,69 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
   : ["*"];
 
-// ---------- COST TRACKER ----------
-let dailyCost = 0, monthlyCost = 0;
-function logCost(amount){ dailyCost+=amount; monthlyCost+=amount; }
-function resetDaily(){
+// ---------- COST TRACKER (improved) ----------
+let dailyCost = 0;
+let monthlyCost = 0;
+
+// prevent duplicate reset prints if Render restarts
+let lastMonthReset = 0;
+let lastDayReset = 0;
+
+function logCost(amount) {
+  dailyCost += amount;
+  monthlyCost += amount;
+}
+
+function resetDaily() {
+  const now = Date.now();
+  if (now - lastDayReset < 60_000) return;   // avoid duplicate same-minute logs
+  lastDayReset = now;
   console.log(`📊 Daily total: $${dailyCost.toFixed(4)} | Monthly: $${monthlyCost.toFixed(4)}`);
-  dailyCost=0;
+  dailyCost = 0;
 }
-function resetMonthly(){
+
+function resetMonthly() {
+  const now = Date.now();
+  if (now - lastMonthReset < 60_000) return;
+  lastMonthReset = now;
   console.log(`💰 Monthly total reset. Prev month: $${monthlyCost.toFixed(4)}`);
-  monthlyCost=0;
+  monthlyCost = 0;
 }
-setInterval(resetDaily, 24*60*60*1000);
-setInterval(resetMonthly, 30*24*60*60*1000);
+
+// schedule daily reset at next UTC midnight
+function scheduleDailyReset() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0, 0, 0
+  ));
+  const delay = next - now;
+  setTimeout(() => {
+    resetDaily();
+    setInterval(resetDaily, 24 * 60 * 60 * 1000);
+  }, delay);
+}
+
+// schedule monthly reset at start of next UTC month
+function scheduleMonthlyReset() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth() + 1,
+    1, 0, 0, 0
+  ));
+  const delay = next - now;
+  setTimeout(() => {
+    resetMonthly();
+    setInterval(resetMonthly, 30 * 24 * 60 * 60 * 1000);
+  }, delay);
+}
+
+// kick off the timers
+scheduleDailyReset();
+scheduleMonthlyReset();
 
 // ---------- BOOT ----------
 console.log("\n🎮 Gamescan API starting...");
